@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "client",
+    "name": "Math Duel Arena",
     "slug": "mathduel",
     "scheme": "mathduel",
     "version": "1.0.0",
@@ -11,6 +11,8 @@
       "supportsTablet": true
     },
     "android": {
+      "package": "com.tanviiiii.mathduel",
+      "versionCode": 1,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -25,6 +27,12 @@
     "plugins": [
       "expo-secure-store",
       "expo-web-browser"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "da40cd14-11f2-4e59-8264-4d0c9e516401"
+      }
+    },
+    "owner": "tanviiiii"
   }
 }

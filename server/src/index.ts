@@ -147,6 +147,10 @@ app.post('/auth/verify-otp', async (req, res) => {
 
 // ─── Auth: Refresh Token ────────────────────────────────────────────────────────
 app.post('/auth/refresh', async (req, res) => {
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.socket.remoteAddress ?? 'unknown';
+  if (!rateLimit(`refresh:${ip}`, 10, 15 * 60 * 1000)) {
+    return res.status(429).json({ error: 'Too many requests.' });
+  }
   const { refreshToken } = req.body as { refreshToken: string };
   if (!refreshToken) return res.status(400).json({ error: 'No refresh token provided' });
 
@@ -176,6 +180,9 @@ app.post('/auth/create-profile', async (req, res) => {
   const { username, avatarColor } = req.body as { username: string; avatarColor: string };
   if (!username?.trim() || username.trim().length < 3) {
     return res.status(400).json({ error: 'Username must be at least 3 characters.' });
+  }
+  if (avatarColor && !/^#[0-9A-Fa-f]{6}(:[^:]{1,10})?$/.test(avatarColor)) {
+    return res.status(400).json({ error: 'Invalid avatar color.' });
   }
 
   try {
@@ -299,6 +306,11 @@ async function verifyToken(token: string): Promise<{ userId: string; email?: str
     const { data, error } = await authClient.auth.getUser(token);
     if (error || !data.user) return null;
     const result = { userId: data.user.id, email: data.user.email };
+    // Evict oldest entry if cache is too large (prevents OOM under token-spray attacks)
+    if (_tokenCache.size >= 500) {
+      const firstKey = _tokenCache.keys().next().value;
+      if (firstKey) _tokenCache.delete(firstKey);
+    }
     _tokenCache.set(token, { ...result, expiresAt: now + 5 * 60 * 1000 });
     return result;
   } catch (err: any) {
@@ -435,8 +447,7 @@ io.use(async (socket, next) => {
   const token = socket.handshake.auth?.token as string | undefined;
 
   if (!token) {
-    console.warn(`[socket] No token for ${socket.id} — allowing as guest`);
-    return next();
+    return next(new Error('Authentication required'));
   }
 
   try {
@@ -740,10 +751,16 @@ io.on('connection', (socket) => {
 
   socket.on('submit_answer', ({ answer }: { answer: number }) => {
     if (!socket.data.userId) return;
+    // Rate limit: max 5 submissions/second per socket
+    if (!rateLimit(`answer:${socket.id}`, 5, 1000)) return;
+
     const roomId = playerToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
     if (!room || room.status !== 'PLAYING' || !room.currentQuestion) return;
+
+    // Validate answer is a finite integer
+    if (!Number.isFinite(answer) || !Number.isInteger(answer)) return;
 
     const scoringPlayer = room.players.find(p => p.id === socket.id);
     if (!scoringPlayer) return;
