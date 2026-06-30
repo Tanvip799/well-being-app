@@ -12,7 +12,13 @@ import HistoryScreen from './src/screens/HistoryScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
 import LoginScreen from './src/screens/LoginScreen';
 
+// ── Switch between local dev and production ──────────────────────────────────
+// Set PRODUCTION_SERVER_URL to your Railway/Fly.io URL once deployed.
+// Leave empty to auto-detect the local Expo dev server IP.
+const PRODUCTION_SERVER_URL = ''; // e.g. 'https://mathduel.up.railway.app'
+
 function getDefaultServerUrl() {
+  if (PRODUCTION_SERVER_URL) return PRODUCTION_SERVER_URL;
   const debuggerHost =
     Constants.expoConfig?.hostUri || (Constants as any).manifest?.debuggerHost;
   if (debuggerHost) {

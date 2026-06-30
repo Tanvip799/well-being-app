@@ -415,7 +415,6 @@ const s = StyleSheet.create({
   rowRight: {
     flexDirection: 'column',
     alignItems: 'flex-end',
-    alignItems: 'center',
     gap: 8,
   },
   rowRating: { fontSize: 15, fontWeight: '800', color: COLORS.accent, textAlign: 'right' },

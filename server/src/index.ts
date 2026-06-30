@@ -199,7 +199,8 @@ app.post('/auth/create-profile', async (req, res) => {
         id: payload.userId,
         username: cleanUsername,
         avatar_color: avatarColor || '#0ECE8F',
-        xp: 1000,
+        xp: 0,
+        rating: 500,
         wins: 0,
         losses: 0,
         streak: 0,
@@ -530,7 +531,6 @@ interface GameRoom {
   questionSentAt: number;
   status: 'COUNTDOWN' | 'PLAYING' | 'GAME_OVER';
   winnerId: string | null;
-  questionSentAt: number;
   matchEndTime: number;
   matchTimer?: NodeJS.Timeout;
   countdownInterval?: NodeJS.Timeout;
@@ -573,8 +573,8 @@ function endMatchByTimer(roomId: string) {
   p2.xpBreakdown = bd2;
 
   // Rating (competitive, can go down)
-  const r1 = p1.rating ?? 1000;
-  const r2 = p2.rating ?? 1000;
+  const r1 = p1.rating ?? 500;
+  const r2 = p2.rating ?? 500;
   p1.ratingChange = calcRatingChange(r1, r2, isP1Winner && !isTie, isTie);
   p2.ratingChange = calcRatingChange(r2, r1, !isP1Winner && !isTie, isTie);
   p1.rating = Math.max(0, r1 + p1.ratingChange);
@@ -600,8 +600,8 @@ io.on('connection', (socket) => {
     }
 
     const cleanUsername = username?.trim() || `Player_${socket.id.slice(0, 4)}`;
-    let initialXP = xp || 1000;
-    let initialRating = 1000;
+    let initialXP = xp || 0;
+    let initialRating = 500;
     let isFirstMatchToday = false;
 
     if (socket.data.userId) {
