@@ -1,13 +1,16 @@
-import React, { useState } from 'react';
-import { StyleSheet, View, SafeAreaView, StatusBar, Platform } from 'react-native';
+import React, { useState, useEffect } from 'react';
+import { StyleSheet, View, StatusBar, Platform, ActivityIndicator } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar as ExpoStatusBar } from 'expo-status-bar';
+import * as SecureStore from 'expo-secure-store';
 import Constants from 'expo-constants';
 import { COLORS } from './src/theme';
 import SplashScreen from './src/screens/SplashScreen';
 import MentalScreen from './src/screens/MentalScreen';
 import LeaderboardScreen from './src/screens/LeaderboardScreen';
-import HistoryScreen, { HistoryItem } from './src/screens/HistoryScreen';
+import HistoryScreen from './src/screens/HistoryScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
+import LoginScreen from './src/screens/LoginScreen';
 
 function getDefaultServerUrl() {
   const debuggerHost =
@@ -27,94 +30,105 @@ type TabType = 'home' | 'leaderboard' | 'history' | 'profile';
 export default function App() {
   const [showSplash, setShowSplash] = useState(true);
   const [activeTab, setActiveTab] = useState<TabType>('home');
-  const [isGameActive, setIsGameActive] = useState(false);
+  const [bootstrapping, setBootstrapping] = useState(true); // checking stored JWT
 
-  // User state
-  const [username, setUsername] = useState('Alex Rivera');
-  const [serverUrl, setServerUrl] = useState(getDefaultServerUrl());
+  // Auth
+  const [jwtToken, setJwtToken] = useState<string | null>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const serverUrl = getDefaultServerUrl();
 
-  // Preferences
-  const [soundEnabled, setSoundEnabled] = useState(true);
-  const [vibrationEnabled, setVibrationEnabled] = useState(true);
+  // User data — all sourced from DB
+  const [userId, setUserId] = useState<number | null>(null);
+  const [username, setUsername] = useState('');
+  const [xp, setXp] = useState(1000);
+  const [wins, setWins] = useState(0);
+  const [losses, setLosses] = useState(0);
+  const [streak, setStreak] = useState(0);
 
-  // Stats
-  const [wins, setWins] = useState(182);
-  const [totalGames, setTotalGames] = useState(278);
-  const [xp, setXp] = useState(1420);
-  const [streak, setStreak] = useState(5);
-
-  // Match history
-  const [history, setHistory] = useState<HistoryItem[]>([
-    {
-      id: 'h1',
-      opponentName: 'Maya K.',
-      myScore: 5,
-      oppScore: 3,
-      won: true,
-      timestamp: 'Today',
-      duration: '1:42',
-    },
-    {
-      id: 'h2',
-      opponentName: 'Jon Park',
-      myScore: 4,
-      oppScore: 5,
-      won: false,
-      timestamp: 'Today',
-      duration: '2:08',
-    },
-    {
-      id: 'h3',
-      opponentName: 'Lena B.',
-      myScore: 5,
-      oppScore: 1,
-      won: true,
-      timestamp: 'Yesterday',
-      duration: '1:15',
-    },
-    {
-      id: 'h4',
-      opponentName: 'Tom M.',
-      myScore: 5,
-      oppScore: 4,
-      won: true,
-      timestamp: 'Jun 27',
-      duration: '1:58',
-    },
-  ]);
-
-  const navigateTo = (tab: TabType) => setActiveTab(tab);
-  const goHome = () => setActiveTab('home');
-
-  const handleGameFinished = (result: {
-    won: boolean;
-    opponentName: string;
-    myScore: number;
-    oppScore: number;
-  }) => {
-    const xpGained = result.won ? 120 : 10;
-    setXp((prev) => prev + xpGained);
-    setTotalGames((prev) => prev + 1);
-    if (result.won) {
-      setWins((prev) => prev + 1);
-      setStreak((prev) => prev + 1);
-    } else {
-      setStreak(0);
-    }
-
-    const newItem: HistoryItem = {
-      id: `match_${Date.now()}`,
-      opponentName: result.opponentName,
-      myScore: result.myScore,
-      oppScore: result.oppScore,
-      won: result.won,
-      timestamp: 'Just now',
-      duration: '--',
+  // ── On mount: try restoring session from SecureStore ──────────────────────────
+  useEffect(() => {
+    const restoreSession = async () => {
+      try {
+        if (Platform.OS === 'web') { setBootstrapping(false); return; }
+        const storedToken = await SecureStore.getItemAsync('jwt_token');
+        if (storedToken) {
+          const ok = await loadUserFromDB(storedToken);
+          if (ok) {
+            setJwtToken(storedToken);
+            setIsAuthenticated(true);
+          }
+        }
+      } catch (e) {
+        console.warn('Session restore failed:', e);
+      } finally {
+        setBootstrapping(false);
+      }
     };
-    setHistory((prev) => [newItem, ...prev]);
+    restoreSession();
+  }, []);
+
+  // ── Load/refresh user data from DB using JWT ──────────────────────────────────
+  const loadUserFromDB = async (token: string): Promise<boolean> => {
+    try {
+      const res = await fetch(`${serverUrl}/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return false;
+      const data = await res.json();
+      const u = data.user;
+      setUserId(u.id);
+      setUsername(u.username);
+      setXp(u.xp);
+      setWins(u.wins);
+      setLosses(u.losses);
+      return true;
+    } catch {
+      return false;
+    }
   };
 
-  // ── Splash ──
+  const handleLoginSuccess = async (
+    name: string,
+    _email: string,
+    userXp: number,
+    userWins: number,
+    token: string,
+    uid: number
+  ) => {
+    setJwtToken(token);
+    setUsername(name);
+    setXp(userXp);
+    setWins(userWins);
+    setUserId(uid);
+    setIsAuthenticated(true);
+    // Immediately refresh from DB to get freshest values
+    await loadUserFromDB(token);
+  };
+
+  const handleGameFinished = async (_result: {
+    won: boolean; opponentName: string;
+    myScore: number; oppScore: number; ratingChange: number;
+  }) => {
+    // Update streak locally for immediate feedback
+    if (_result.won) setStreak(s => s + 1); else setStreak(0);
+    // Refresh all stats from DB (xp, wins, losses updated server-side)
+    if (jwtToken) await loadUserFromDB(jwtToken);
+  };
+
+  const handleLogout = async () => {
+    if (Platform.OS !== 'web') await SecureStore.deleteItemAsync('jwt_token');
+    setJwtToken(null);
+    setIsAuthenticated(false);
+    setUsername('');
+    setUserId(null);
+    setXp(1000);
+    setWins(0);
+    setLosses(0);
+    setStreak(0);
+    setActiveTab('home');
+  };
+
+  // ── Splash ────────────────────────────────────────────────────────────────────
   if (showSplash) {
     return (
       <>
@@ -124,19 +138,37 @@ export default function App() {
     );
   }
 
-  // ── Screens ──
+  // ── JWT restore loading spinner ───────────────────────────────────────────────
+  if (bootstrapping) {
+    return (
+      <View style={{ flex: 1, backgroundColor: COLORS.background, alignItems: 'center', justifyContent: 'center' }}>
+        <ActivityIndicator size="large" color={COLORS.primary} />
+      </View>
+    );
+  }
+
   const renderScreen = () => {
+    if (!isAuthenticated) {
+      return (
+        <LoginScreen
+          serverUrl={serverUrl}
+          onLoginSuccess={handleLoginSuccess}
+        />
+      );
+    }
+
     switch (activeTab) {
       case 'home':
         return (
           <MentalScreen
             username={username}
             serverUrl={serverUrl}
-            soundEnabled={soundEnabled}
-            vibrationEnabled={vibrationEnabled}
-            onScreenStateChange={(state) => setIsGameActive(state !== 'LOBBY')}
+            jwtToken={jwtToken}
+            soundEnabled={true}
+            vibrationEnabled={true}
+            onScreenStateChange={() => {}}
             onGameFinished={handleGameFinished}
-            navigateTo={navigateTo}
+            navigateTo={setActiveTab}
             wins={wins}
             xp={xp}
             streak={streak}
@@ -149,19 +181,22 @@ export default function App() {
             currentUsername={username}
             currentUserXP={xp}
             wins={wins}
-            onBack={goHome}
+            serverUrl={serverUrl}
+            jwtToken={jwtToken}
+            onBack={() => setActiveTab('home')}
           />
         );
 
       case 'history':
         return (
           <HistoryScreen
-            history={history}
+            serverUrl={serverUrl}
+            jwtToken={jwtToken}
             wins={wins}
-            totalGames={totalGames}
+            losses={losses}
             xp={xp}
             streak={streak}
-            onBack={goHome}
+            onBack={() => setActiveTab('home')}
           />
         );
 
@@ -169,16 +204,11 @@ export default function App() {
         return (
           <ProfileScreen
             username={username}
-            setUsername={setUsername}
-            serverUrl={serverUrl}
-            setServerUrl={setServerUrl}
-            soundEnabled={soundEnabled}
-            setSoundEnabled={setSoundEnabled}
-            vibrationEnabled={vibrationEnabled}
-            setVibrationEnabled={setVibrationEnabled}
+            email=""
             wins={wins}
             xp={xp}
-            onBack={goHome}
+            onBack={() => setActiveTab('home')}
+            onLogout={handleLogout}
           />
         );
 
@@ -188,10 +218,12 @@ export default function App() {
   };
 
   return (
-    <SafeAreaView style={s.container}>
-      <ExpoStatusBar style="light" />
-      <View style={s.screen}>{renderScreen()}</View>
-    </SafeAreaView>
+    <SafeAreaProvider>
+      <SafeAreaView style={s.container}>
+        <ExpoStatusBar style="light" />
+        <View style={s.screen}>{renderScreen()}</View>
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 

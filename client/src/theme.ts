@@ -1,33 +1,56 @@
 // Math Duel — Emerald & Cyan Design System
-export const COLORS = {
-  // Backgrounds
-  background: '#0D1117',
-  surface: '#161B22',
-  surfaceCard: '#1C2128',
-  surfaceMedium: '#21262D',
+export const getThemeColors = (isDark: boolean) => {
+  return {
+    // Backgrounds
+    background: isDark ? '#0D1117' : '#F6F8FA',
+    surface: isDark ? '#161B22' : '#FFFFFF',
+    surfaceCard: isDark ? '#1C2128' : '#F1F5F9',
+    surfaceMedium: isDark ? '#21262D' : '#E2E8F0',
 
-  // Borders
-  border: '#30363D',
-  borderSubtle: '#21262D',
-  surfaceLight: '#1C2128',
+    // Borders (Defined and crisp!)
+    border: isDark ? '#30363D' : '#D1D5DB',
+    borderSubtle: isDark ? '#21262D' : '#E2E8F0',
+    surfaceLight: isDark ? '#1C2128' : '#F8FAFC',
 
-  // Text
-  text: '#FFFFFF',
-  textSecondary: '#8B949E',
-  textMuted: '#484F58',
+    // Text
+    text: isDark ? '#FFFFFF' : '#0F172A',
+    textSecondary: isDark ? '#8B949E' : '#475569',
+    textMuted: isDark ? '#484F58' : '#94A3B8',
 
-  // Primary — Emerald
-  primary: '#0ECE8F',
-  primaryDark: '#0AAF79',
-  primaryGlow: 'rgba(14, 206, 143, 0.2)',
-  primaryBg: 'rgba(14, 206, 143, 0.12)',
+    // Primary — Emerald
+    primary: '#0ECE8F',
+    primaryDark: '#0AAF79',
+    primaryGlow: isDark ? 'rgba(14, 206, 143, 0.25)' : 'rgba(14, 206, 143, 0.15)',
+    primaryBg: isDark ? 'rgba(14, 206, 143, 0.12)' : 'rgba(14, 206, 143, 0.08)',
 
-  // Status
-  error: '#F85149',
-  errorBg: 'rgba(248, 81, 73, 0.18)',
-  success: '#3FB950',
-  successBg: 'rgba(63, 185, 80, 0.18)',
+    // Accent — Cyan
+    accent: '#00D4FF',
+    accentDark: '#00A6CC',
+    accentGlow: isDark ? 'rgba(0, 212, 255, 0.25)' : 'rgba(0, 212, 255, 0.15)',
+    accentBg: isDark ? 'rgba(0, 212, 255, 0.12)' : 'rgba(0, 212, 255, 0.08)',
+
+    // Podium/Rankings
+    gold: '#FFD700',
+    goldBg: 'rgba(255, 215, 0, 0.15)',
+    silver: '#E2E8F0',
+    silverBg: 'rgba(226, 232, 240, 0.15)',
+    bronze: '#CD7F32',
+    bronzeBg: 'rgba(205, 127, 50, 0.15)',
+
+    // Glassmorphism
+    borderGlass: isDark ? 'rgba(255, 255, 255, 0.07)' : 'rgba(15, 23, 42, 0.05)',
+    surfaceGlass: isDark ? 'rgba(22, 27, 34, 0.75)' : 'rgba(255, 255, 255, 0.85)',
+    surfaceGlassLight: isDark ? 'rgba(28, 33, 40, 0.55)' : 'rgba(255, 255, 255, 0.55)',
+
+    // Status
+    error: '#F85149',
+    errorBg: 'rgba(248, 81, 73, 0.18)',
+    success: '#3FB950',
+    successBg: 'rgba(63, 185, 80, 0.18)',
+  };
 };
+
+export const COLORS = getThemeColors(true);
 
 export const SHADOWS = {
   primary: {

@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  server:
+    build: 
+      context: ./server
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgres://postgres:Tanvi@799@db:5432/mathduel
+      - JWT_SECRET=super_secret_jwt_key_123
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  db:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=Tanvi@799
+      - POSTGRES_DB=mathduel
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

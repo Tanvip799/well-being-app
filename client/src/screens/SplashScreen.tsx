@@ -1,46 +1,74 @@
 import React, { useEffect, useRef } from 'react';
-import { Animated, StyleSheet, Text, View } from 'react-native';
+import { Animated, StyleSheet, Text, View, Easing, Dimensions, Platform } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { COLORS } from '../theme';
+
+const { width } = Dimensions.get('window');
 
 export default function SplashScreen({ onFinish }: { onFinish: () => void }) {
   const fade = useRef(new Animated.Value(0)).current;
   const scale = useRef(new Animated.Value(0.82)).current;
   const barWidth = useRef(new Animated.Value(0)).current;
+  const floatAnim = useRef(new Animated.Value(0)).current;
+  const pulseAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
+    const isWeb = Platform.OS === 'web';
     Animated.parallel([
-      Animated.timing(fade, { toValue: 1, duration: 700, useNativeDriver: true }),
-      Animated.spring(scale, { toValue: 1, friction: 5, tension: 70, useNativeDriver: true }),
-      Animated.timing(barWidth, { toValue: 1, duration: 2400, useNativeDriver: false }),
+      Animated.timing(fade, { toValue: 1, duration: 600, useNativeDriver: !isWeb }),
+      Animated.spring(scale, { toValue: 1, friction: 6, tension: 80, useNativeDriver: !isWeb }),
+      Animated.timing(barWidth, { toValue: 1, duration: 2200, useNativeDriver: false }),
     ]).start();
 
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(floatAnim, { toValue: 1, duration: 2500, easing: Easing.inOut(Easing.ease), useNativeDriver: !isWeb }),
+        Animated.timing(floatAnim, { toValue: 0, duration: 2500, easing: Easing.inOut(Easing.ease), useNativeDriver: !isWeb }),
+      ])
+    ).start();
+
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1.04, duration: 1200, easing: Easing.inOut(Easing.ease), useNativeDriver: !isWeb }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 1200, easing: Easing.inOut(Easing.ease), useNativeDriver: !isWeb }),
+      ])
+    ).start();
+
     const t = setTimeout(() => {
-      Animated.timing(fade, { toValue: 0, duration: 400, useNativeDriver: true }).start(() => onFinish());
-    }, 2600);
+      Animated.timing(fade, { toValue: 0, duration: 450, useNativeDriver: !isWeb }).start(() => onFinish());
+    }, 2500);
     return () => clearTimeout(t);
   }, []);
+
+  const floatY1 = floatAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -12] });
+  const floatY2 = floatAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 15] });
+  const floatY3 = floatAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -8] });
+  const floatY4 = floatAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 10] });
+
+  const logoScale = Animated.multiply(scale, pulseAnim);
 
   return (
     <View style={s.container}>
       <View style={s.glowCenter} />
 
-      {/* Faint math symbols */}
-      <Text style={[s.symbol, { top: '17%', left: '9%', fontSize: 20 }]}>+</Text>
-      <Text style={[s.symbol, { top: '24%', right: '11%', fontSize: 15 }]}>×</Text>
-      <Text style={[s.symbol, { bottom: '33%', left: '13%', fontSize: 17 }]}>−</Text>
-      <Text style={[s.symbol, { bottom: '24%', right: '10%', fontSize: 19 }]}>+</Text>
-      <Text style={[s.symbol, { top: '13%', right: '30%', fontSize: 13 }]}>÷</Text>
+      <Animated.Text style={[s.symbol, { top: '15%', left: '10%', fontSize: 24, transform: [{ translateY: floatY1 }] }]}>+</Animated.Text>
+      <Animated.Text style={[s.symbol, { top: '22%', right: '12%', fontSize: 20, transform: [{ translateY: floatY2 }] }]}>×</Animated.Text>
+      <Animated.Text style={[s.symbol, { bottom: '30%', left: '15%', fontSize: 22, transform: [{ translateY: floatY3 }] }]}>−</Animated.Text>
+      <Animated.Text style={[s.symbol, { bottom: '22%', right: '14%', fontSize: 26, transform: [{ translateY: floatY4 }] }]}>÷</Animated.Text>
+      <Animated.Text style={[s.symbol, { top: '12%', right: '35%', fontSize: 16, transform: [{ translateY: floatY1 }] }]}>=</Animated.Text>
+      <Animated.Text style={[s.symbol, { bottom: '45%', right: '8%', fontSize: 18, transform: [{ translateY: floatY3 }] }]}>%</Animated.Text>
 
-      <Animated.View style={[s.content, { opacity: fade, transform: [{ scale }] }]}>
-        <LinearGradient
-          colors={['#0ECE8F', '#00D4FF']}
-          start={{ x: 0, y: 0 }}
-          end={{ x: 1, y: 1 }}
-          style={s.logoBox}
-        >
-          <Text style={s.divideSymbol}>÷</Text>
-        </LinearGradient>
+      <Animated.View style={[s.content, { opacity: fade, transform: [{ scale: logoScale }] }]}>
+        <View style={s.shadowWrapper}>
+          <LinearGradient
+            colors={[COLORS.primary, COLORS.accent]}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 1 }}
+            style={s.logoBox}
+          >
+            <Text style={s.divideSymbol}>÷</Text>
+          </LinearGradient>
+        </View>
 
         <Text style={s.titleRow}>
           <Text style={s.titleMath}>Math </Text>
@@ -50,7 +78,6 @@ export default function SplashScreen({ onFinish }: { onFinish: () => void }) {
         <Text style={s.tagline}>Think Fast. Solve Faster.</Text>
       </Animated.View>
 
-      {/* Loading bar at bottom */}
       <View style={s.loadingContainer}>
         <View style={s.barTrack}>
           <Animated.View
@@ -59,13 +86,13 @@ export default function SplashScreen({ onFinish }: { onFinish: () => void }) {
               {
                 width: barWidth.interpolate({
                   inputRange: [0, 1],
-                  outputRange: ['0%', '90%'],
+                  outputRange: ['0%', '100%'],
                 }),
               },
             ]}
           />
         </View>
-        <Text style={s.loadingText}>Loading your arena...</Text>
+        <Text style={s.loadingText}>LOADING YOUR ARENA...</Text>
       </View>
     </View>
   );
@@ -74,46 +101,56 @@ export default function SplashScreen({ onFinish }: { onFinish: () => void }) {
 const s = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#0B1120',
+    backgroundColor: '#070A13',
     alignItems: 'center',
     justifyContent: 'center',
   },
   glowCenter: {
     position: 'absolute',
-    width: 300,
-    height: 300,
-    borderRadius: 150,
-    backgroundColor: '#0ECE8F',
-    opacity: 0.04,
+    width: 320,
+    height: 320,
+    borderRadius: 160,
+    backgroundColor: COLORS.primaryGlow,
+    opacity: 0.12,
     top: '25%',
   },
   symbol: {
     position: 'absolute',
-    color: '#1B3028',
+    color: '#1B243B',
     fontWeight: '700',
   },
   content: {
     alignItems: 'center',
   },
-  logoBox: {
-    width: 88,
-    height: 88,
-    borderRadius: 24,
-    alignItems: 'center',
-    justifyContent: 'center',
+  shadowWrapper: {
+    shadowColor: COLORS.primary,
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.4,
+    shadowRadius: 24,
+    elevation: 15,
     marginBottom: 28,
   },
+  logoBox: {
+    width: 96,
+    height: 96,
+    borderRadius: 26,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255, 255, 255, 0.15)',
+  },
   divideSymbol: {
-    fontSize: 42,
+    fontSize: 48,
     color: '#FFF',
     fontWeight: '300',
-    lineHeight: 50,
+    lineHeight: 52,
     includeFontPadding: false,
   },
   titleRow: {
-    fontSize: 40,
-    lineHeight: 48,
-    marginBottom: 12,
+    fontSize: 44,
+    lineHeight: 52,
+    marginBottom: 10,
+    letterSpacing: -0.5,
   },
   titleMath: {
     color: '#FFFFFF',
@@ -124,21 +161,22 @@ const s = StyleSheet.create({
     fontWeight: '800',
   },
   tagline: {
-    fontSize: 15,
+    fontSize: 16,
     color: COLORS.textSecondary,
-    fontWeight: '400',
+    fontWeight: '500',
+    letterSpacing: 0.5,
   },
   loadingContainer: {
     position: 'absolute',
     bottom: 72,
-    width: '58%',
+    width: '64%',
     alignItems: 'center',
-    gap: 10,
+    gap: 12,
   },
   barTrack: {
     width: '100%',
-    height: 3,
-    backgroundColor: '#1A2235',
+    height: 4,
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
     borderRadius: 2,
     overflow: 'hidden',
   },
@@ -146,10 +184,15 @@ const s = StyleSheet.create({
     height: '100%',
     backgroundColor: COLORS.primary,
     borderRadius: 2,
+    shadowColor: COLORS.primary,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.8,
+    shadowRadius: 4,
   },
   loadingText: {
     fontSize: 11,
-    color: COLORS.textMuted,
-    fontWeight: '400',
+    color: COLORS.textSecondary,
+    fontWeight: '700',
+    letterSpacing: 2,
   },
 });

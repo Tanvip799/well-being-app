@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { StyleSheet, Text, View, Animated, Easing, Dimensions } from 'react-native';
+import { StyleSheet, Text, View, Animated, Easing, Dimensions, Platform } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import { COLORS } from '../theme';
@@ -17,7 +17,7 @@ export default function PhysicalScreen() {
           toValue: 1,
           duration: 3500,
           easing: Easing.bezier(0.25, 0.1, 0.25, 1),
-          useNativeDriver: true,
+          useNativeDriver: Platform.OS !== 'web',
         })
       ).start();
     };

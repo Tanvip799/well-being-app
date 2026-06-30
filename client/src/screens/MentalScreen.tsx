@@ -9,18 +9,21 @@ import {
   Vibration,
   View,
   Alert,
+  Dimensions,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import { io, Socket } from 'socket.io-client';
 import { COLORS, getInitials, getAvatarColor } from '../theme';
 
+const { width } = Dimensions.get('window');
+
 // ── Rounded-square avatar (Match Found / Versus) ────────────────────────────
 function AvatarSquare({ name, isMe, color, size = 72 }: { name: string; isMe?: boolean; color?: string; size?: number }) {
   const bg = isMe ? COLORS.primary : (color ?? getAvatarColor(name));
   return (
-    <View style={{ width: size, height: size, borderRadius: size * 0.26, backgroundColor: bg, alignItems: 'center', justifyContent: 'center' }}>
-      <Text style={{ fontSize: size * 0.33, fontWeight: '700', color: '#FFF', letterSpacing: 0.5 }}>
+    <View style={{ width: size, height: size, borderRadius: size * 0.28, backgroundColor: bg, alignItems: 'center', justifyContent: 'center', shadowColor: bg, shadowOpacity: 0.3, shadowRadius: 10, elevation: 4 }}>
+      <Text style={{ fontSize: size * 0.36, fontWeight: '800', color: '#FFF', letterSpacing: 0.5 }}>
         {getInitials(name)}
       </Text>
     </View>
@@ -31,24 +34,37 @@ function AvatarSquare({ name, isMe, color, size = 72 }: { name: string; isMe?: b
 interface MentalScreenProps {
   username: string;
   serverUrl: string;
+  jwtToken?: string | null;
   soundEnabled: boolean;
   vibrationEnabled: boolean;
   onScreenStateChange: (s: string) => void;
-  onGameFinished: (r: { won: boolean; opponentName: string; myScore: number; oppScore: number }) => void;
+  onGameFinished: (r: { won: boolean; opponentName: string; myScore: number; oppScore: number; ratingChange: number }) => void;
   navigateTo: (tab: 'home' | 'leaderboard' | 'history' | 'profile') => void;
   wins: number;
   xp: number;
   streak: number;
 }
 
-interface SocketPlayer { id: string; username: string; score: number; wantsPlayAgain: boolean; }
+interface SocketPlayer { id: string; username: string; score: number; wantsPlayAgain: boolean; xp?: number; xpChange?: number; }
 type ScreenState = 'LOBBY' | 'CONNECTING' | 'SEARCHING' | 'VERSUS' | 'PLAYING' | 'GAME_OVER';
 
-// ════════════════════════════════════════════════════════════════════════════════
-export default function MentalScreen({ username, serverUrl, soundEnabled, vibrationEnabled, onScreenStateChange, onGameFinished, navigateTo, wins, xp, streak }: MentalScreenProps) {
+export default function MentalScreen({
+  username,
+  serverUrl,
+  jwtToken,
+  soundEnabled,
+  vibrationEnabled,
+  onScreenStateChange,
+  onGameFinished,
+  navigateTo,
+  wins,
+  xp,
+  streak,
+}: MentalScreenProps) {
   const [screenState, setScreenState] = useState<ScreenState>('LOBBY');
   const [socket, setSocket]           = useState<Socket | null>(null);
   const [players, setPlayers]         = useState<SocketPlayer[]>([]);
+  const [ratingChange, setRatingChange] = useState(18);
   const [questionText, setQuestionText] = useState('');
   const [lastScorer, setLastScorer]   = useState<string | null>(null);
   const [countdown, setCountdown]     = useState<number | null>(null);
@@ -56,6 +72,7 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
   const [opponentLeft, setOpponentLeft] = useState(false);
   const [answerInput, setAnswerInput] = useState('');
   const [wrongFlash, setWrongFlash]   = useState(false);
+  const [correctFlash, setCorrectFlash] = useState(false);
   const [questionTimer, setQuestionTimer] = useState(60);
   const [questionCount, setQuestionCount] = useState(0);
 
@@ -63,18 +80,71 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
   const qTimerRef      = useRef<any>(null);
   const pendingUpdate  = useRef<any>(null);
   const firstUpdate    = useRef(true);
+
+  // Animations
   const spinAnim       = useRef(new Animated.Value(0)).current;
   const cdScale        = useRef(new Animated.Value(1)).current;
-
+  const pulseRadar     = useRef(new Animated.Value(0)).current;
+  const slideAnim      = useRef(new Animated.Value(0)).current;
+  const shakeAnim      = useRef(new Animated.Value(0)).current;
+  const qScale         = useRef(new Animated.Value(1)).current;
+  const myScoreAnim    = useRef(new Animated.Value(0)).current;
+  const oppScoreAnim   = useRef(new Animated.Value(0)).current;
   const myPlayer  = players.find(p => p.id === socket?.id);
   const oppPlayer = players.find(p => p.id !== socket?.id);
 
+  const myScore = myPlayer?.score ?? 0;
+  const oppScore = oppPlayer?.score ?? 0;
+
+  const prevMyScore = useRef(myScore);
+  const prevOppScore = useRef(oppScore);
+
   useEffect(() => { onScreenStateChange(screenState); }, [screenState]);
 
+  // Handle score increments for floating text indicators (+1)
+  useEffect(() => {
+    if (myScore > prevMyScore.current && !firstUpdate.current) {
+      myScoreAnim.setValue(0);
+      Animated.timing(myScoreAnim, { toValue: 1, duration: 600, useNativeDriver: Platform.OS !== 'web' }).start();
+    }
+    prevMyScore.current = myScore;
+  }, [myScore]);
+
+  useEffect(() => {
+    if (oppScore > prevOppScore.current && !firstUpdate.current) {
+      oppScoreAnim.setValue(0);
+      Animated.timing(oppScoreAnim, { toValue: 1, duration: 600, useNativeDriver: Platform.OS !== 'web' }).start();
+    }
+    prevOppScore.current = oppScore;
+  }, [oppScore]);
+
+  // Spring animation when questionText changes
+  useEffect(() => {
+    if (questionText) {
+      qScale.setValue(0.85);
+      Animated.spring(qScale, { toValue: 1, friction: 6, tension: 120, useNativeDriver: Platform.OS !== 'web' }).start();
+    }
+  }, [questionText]);
+
+  // Radar scanning & floating logic
   useEffect(() => {
     if (screenState === 'SEARCHING') {
-      Animated.loop(Animated.timing(spinAnim, { toValue: 1, duration: 2500, easing: Easing.linear, useNativeDriver: true })).start();
-    } else { spinAnim.setValue(0); }
+      Animated.loop(
+        Animated.timing(spinAnim, { toValue: 1, duration: 2200, easing: Easing.linear, useNativeDriver: Platform.OS !== 'web' })
+      ).start();
+
+      Animated.loop(
+        Animated.timing(pulseRadar, { toValue: 1, duration: 1800, easing: Easing.out(Easing.ease), useNativeDriver: Platform.OS !== 'web' })
+      ).start();
+    } else {
+      spinAnim.setValue(0);
+      pulseRadar.setValue(0);
+    }
+
+    if (screenState === 'VERSUS') {
+      slideAnim.setValue(0);
+      Animated.spring(slideAnim, { toValue: 1, tension: 50, friction: 7, useNativeDriver: Platform.OS !== 'web' }).start();
+    }
   }, [screenState]);
 
   const startQTimer = () => {
@@ -84,14 +154,32 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
   };
   const stopQTimer = () => { if (qTimerRef.current) { clearInterval(qTimerRef.current); qTimerRef.current = null; } };
 
+  // Trigger text field shake on wrong answer
+  const triggerShake = () => {
+    shakeAnim.setValue(0);
+    Animated.sequence([
+      Animated.timing(shakeAnim, { toValue: 8, duration: 40, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(shakeAnim, { toValue: -8, duration: 40, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(shakeAnim, { toValue: 6, duration: 40, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(shakeAnim, { toValue: -6, duration: 40, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(shakeAnim, { toValue: 4, duration: 40, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(shakeAnim, { toValue: 0, duration: 40, useNativeDriver: Platform.OS !== 'web' }),
+    ]).start();
+  };
+
   const startMatchmaking = () => {
     setScreenState('CONNECTING');
-    const sock = io(serverUrl, { transports: ['websocket'], forceNew: true, timeout: 6000 });
+    const sock = io(serverUrl, {
+      transports: ['websocket'],
+      forceNew: true,
+      timeout: 6000,
+      auth: jwtToken ? { token: jwtToken } : {},
+    });
 
     sock.on('connect', () => {
       setSocket(sock);
       setScreenState('SEARCHING');
-      sock.emit('join_queue', { username });
+      sock.emit('join_queue', { username, xp });
     });
 
     sock.on('connect_error', () => {
@@ -104,12 +192,14 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
       firstUpdate.current = true;
       setPlayers(data.players); setOpponentLeft(false);
       setCountdown(3); setScreenState('VERSUS'); setWinnerId(null); setQuestionCount(0);
+      // Handshake: tell the server we are successfully on the Match screen and ready for countdown
+      sock.emit('versus_ready');
     });
 
     sock.on('countdown_tick', (data: { count: number }) => {
       setCountdown(data.count);
-      cdScale.setValue(0.65);
-      Animated.spring(cdScale, { toValue: 1, friction: 3, tension: 130, useNativeDriver: true }).start();
+      cdScale.setValue(0.6);
+      Animated.spring(cdScale, { toValue: 1, friction: 3.5, tension: 140, useNativeDriver: Platform.OS !== 'web' }).start();
     });
 
     sock.on('game_state_update', (data: { status: string; players: SocketPlayer[]; questionText: string; lastScorer: string | null }) => {
@@ -124,7 +214,7 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
             setAnswerInput(''); setWrongFlash(false); setQuestionCount(1);
             setScreenState('PLAYING'); startQTimer(); pendingUpdate.current = null;
           }
-        }, 700);
+        }, 750);
       } else {
         setPlayers(data.players); setQuestionText(data.questionText); setLastScorer(data.lastScorer);
         setAnswerInput(''); setWrongFlash(false); setQuestionCount(n => n + 1); startQTimer();
@@ -132,8 +222,13 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
     });
 
     sock.on('answer_feedback', (data: { correct: boolean }) => {
-      if (!data.correct) {
+      if (data.correct) {
+        setCorrectFlash(true);
+        if (vibrationEnabled) Vibration.vibrate(40);
+        setTimeout(() => setCorrectFlash(false), 400);
+      } else {
         setWrongFlash(true);
+        triggerShake();
         if (vibrationEnabled) Vibration.vibrate([0, 80, 50, 80]);
         setTimeout(() => setWrongFlash(false), 400);
       }
@@ -143,7 +238,17 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
       stopQTimer(); setPlayers(data.players); setWinnerId(data.winnerId); setScreenState('GAME_OVER');
       const opp = data.players.find(p => p.id !== sock.id);
       const isWin = data.winnerId === sock.id;
-      onGameFinished({ won: isWin, opponentName: opp?.username ?? 'Opponent', myScore: data.players.find(p => p.id === sock.id)?.score ?? 0, oppScore: opp?.score ?? 0 });
+      const me = data.players.find(p => p.id === sock.id);
+      const change = me?.xpChange ?? (isWin ? 18 : -12);
+      setRatingChange(change);
+
+      onGameFinished({ 
+        won: isWin, 
+        opponentName: opp?.username ?? 'Opponent', 
+        myScore: me?.score ?? 0, 
+        oppScore: opp?.score ?? 0,
+        ratingChange: change
+      });
       if (vibrationEnabled) { if (isWin) Vibration.vibrate([0, 100, 80, 200, 80, 300]); else Vibration.vibrate(450); }
     });
 
@@ -156,6 +261,7 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
     sock.on('match_restarting', () => {
       firstUpdate.current = true; setCountdown(3); setScreenState('VERSUS');
       setWinnerId(null); setOpponentLeft(false); setQuestionCount(0);
+      sock.emit('versus_ready'); // Handshake for rematch sync countdown
     });
   };
 
@@ -168,7 +274,7 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
   };
 
   const pressKey = (k: string) => {
-    if (vibrationEnabled) Vibration.vibrate(18);
+    if (vibrationEnabled) Vibration.vibrate(15);
     if (k === '⌫') setAnswerInput(p => p.slice(0, -1));
     else if (answerInput.length < 7) setAnswerInput(p => p + k);
   };
@@ -184,13 +290,12 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
   const oppColor = getAvatarColor(oppName);
 
   // ════════════════════════════════════════════════════════════════════════════
-  // SCREEN 02 — LOBBY / HOME
+  // SCREEN: LOBBY / HOME
   // ════════════════════════════════════════════════════════════════════════════
   if (screenState === 'LOBBY') {
+    const winRate = wins > 0 ? Math.min(95, 60 + (wins % 15)) : 0;
     return (
       <View style={s.lobbyRoot}>
-        <View style={s.lobbyGlow} />
-
         {/* ── Header ── */}
         <View style={s.lobbyHeader}>
           <View>
@@ -202,30 +307,66 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
           </View>
         </View>
 
-        {/* ── Center: Logo + Title + Rating ── */}
-        <View style={s.lobbyCenterContent}>
-          <LinearGradient colors={['#0ECE8F', '#11D4A8']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={s.logoBox}>
-            <Text style={s.logoSymbol}>÷</Text>
-          </LinearGradient>
-          <Text style={s.appTitle}>
-            <Text style={{ color: COLORS.text }}>Math </Text>
-            <Text style={{ color: COLORS.primary }}>Duel</Text>
-          </Text>
-          <View style={s.ratingRow}>
-            <View style={s.ratingDot} />
-            <Text style={s.ratingText}>Rating {xp.toLocaleString()} · #128 Global</Text>
+        {/* Card 1: Your Rating Dashboard */}
+        <View style={s.newRatingCard}>
+          <Text style={s.ratingLabel}>YOUR RATING</Text>
+          <View style={s.ratingValueRow}>
+            <Text style={s.ratingValueText}>{xp.toLocaleString()}</Text>
+            <Text style={s.ratingTrendText}>▲ 24</Text>
+          </View>
+          
+          <View style={s.statsCardRow}>
+            <View style={s.statsMiniCard}>
+              <Text style={s.statsMiniVal}>#7</Text>
+              <Text style={s.statsMiniSub}>Global rank</Text>
+            </View>
+            <View style={s.statsMiniCard}>
+              <Text style={s.statsMiniVal}>{winRate}%</Text>
+              <Text style={s.statsMiniSub}>Win rate</Text>
+            </View>
+            <View style={s.statsMiniCard}>
+              <Text style={[s.statsMiniVal, { color: COLORS.accent }]}>{streak}</Text>
+              <Text style={s.statsMiniSub}>Win streak</Text>
+            </View>
           </View>
         </View>
 
-        {/* ── Bottom: Play Now + Nav ── */}
-        <View style={s.lobbyBottom}>
-          <TouchableOpacity onPress={startMatchmaking} activeOpacity={0.84} style={s.playNowWrapper}>
-            <LinearGradient colors={['#0ECE8F', '#11D4A8']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={s.playNowBtn}>
-              <Ionicons name="play" size={20} color="#0B1A14" style={{ marginRight: 10 }} />
-              <Text style={s.playNowText}>Play Now</Text>
-            </LinearGradient>
-          </TouchableOpacity>
+        {/* Card 2: Mental Duel Arena Card with Play Button */}
+        <View style={s.newDuelCard}>
+          <LinearGradient
+            colors={['rgba(14,206,143,0.15)', 'rgba(0,212,255,0.06)']}
+            style={s.newDuelCardGradient}
+          >
+            <View style={s.duelCardHeader}>
+              <View style={s.duelIconWrapper}>
+                <Ionicons name="bulb-outline" size={24} color={COLORS.primary} />
+              </View>
+            </View>
+            
+            <Text style={s.duelTitle}>Mental Duel Arena</Text>
+            <Text style={s.duelDesc}>
+              Battle players globally in speed mental arithmetic. Speed and accuracy wins.
+            </Text>
+            
+            {/* Play Button inside card */}
+            <TouchableOpacity onPress={startMatchmaking} activeOpacity={0.85} style={s.lobbyPlayBtnWrapper}>
+              <LinearGradient
+                colors={['#0ECE8F', '#11D4A8']}
+                start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
+                style={s.lobbyPlayBtn}
+              >
+                <Text style={s.lobbyPlayBtnTitle}>PLAY NOW</Text>
+                <Text style={s.lobbyPlayBtnSub}>Find a ranked match</Text>
+              </LinearGradient>
+            </TouchableOpacity>
+          </LinearGradient>
+        </View>
 
+        {/* Spacer to push content up */}
+        <View style={{ flex: 1 }} />
+
+        {/* Tab Nav Bar */}
+        <View style={s.lobbyBottom}>
           <View style={s.bottomNavRow}>
             {([
               { icon: 'bar-chart', label: 'Leaderboard', tab: 'leaderboard' },
@@ -244,53 +385,63 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // CONNECTING
+  // SCREEN: CONNECTING
   // ════════════════════════════════════════════════════════════════════════════
   if (screenState === 'CONNECTING') {
     return (
       <View style={s.fullCentered}>
-        <LinearGradient colors={['#0ECE8F', '#11D4A8']} style={s.connectLogo}>
-          <Text style={[s.logoSymbol, { fontSize: 30 }]}>÷</Text>
+        <LinearGradient colors={[COLORS.primary, COLORS.accent]} style={s.connectLogo}>
+          <Text style={{ fontSize: 32, color: '#FFF', fontWeight: '200' }}>÷</Text>
         </LinearGradient>
-        <Text style={s.connectTitle}>Connecting...</Text>
-        <Text style={s.connectSub}>Establishing a fast connection</Text>
+        <Text style={s.connectTitle}>Connecting to Arena...</Text>
+        <Text style={s.connectSub}>Securing high-speed real-time link</Text>
       </View>
     );
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // SCREEN 03 — SEARCHING
+  // SCREEN: SEARCHING
   // ════════════════════════════════════════════════════════════════════════════
   if (screenState === 'SEARCHING') {
     const spin = spinAnim.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
+    const radarScale1 = pulseRadar.interpolate({ inputRange: [0, 1], outputRange: [1, 2.2] });
+    const radarOpacity1 = pulseRadar.interpolate({ inputRange: [0, 0.5, 1], outputRange: [0.5, 0.3, 0] });
+    const radarScale2 = pulseRadar.interpolate({ inputRange: [0, 1], outputRange: [1, 1.6] });
+    const radarOpacity2 = pulseRadar.interpolate({ inputRange: [0, 0.4, 0.8, 1], outputRange: [0, 0.5, 0.25, 0] });
+
     return (
       <View style={s.searchRoot}>
-        {/* Center content: radar + text */}
         <View style={s.searchCenter}>
-          {/* Ambient dots */}
           <View style={[s.ambientDot, { top: -60, left: -30 }]} />
           <View style={[s.ambientDot, { top: -40, right: -20, width: 5, height: 5, borderRadius: 2.5 }]} />
 
-          {/* Radar */}
+          {/* Futuristic Glowing Sonar Radar */}
           <View style={s.radarOuter}>
-            <Animated.View style={[s.radarArc, { transform: [{ rotate: spin }] }]} />
+            <Animated.View style={[s.radarPulsingRing, { transform: [{ scale: radarScale1 }], opacity: radarOpacity1 }]} />
+            <Animated.View style={[s.radarPulsingRing, { transform: [{ scale: radarScale2 }], opacity: radarOpacity2 }]} />
+            
+            {/* Concentric helper rings */}
+            <View style={s.radarMiddleRing} />
+            <View style={s.radarInnerRing} />
+
+            <Animated.View style={[s.radarSweep, { transform: [{ rotate: spin }] }]} />
+            
             <View style={s.radarCenter}>
               <View style={s.radarDot} />
             </View>
           </View>
 
-          <Text style={s.searchTitle}>Searching for an{'\n'}opponent...</Text>
-          <Text style={s.searchSub}>Matching you with a player near your rating</Text>
+          <Text style={s.searchTitle}>Searching for Duelist...</Text>
+          <Text style={s.searchSub}>Matching you with a player near rating {xp.toLocaleString()}</Text>
 
           <View style={s.waitPill}>
-            <Text style={s.waitPillText}>Estimated wait  ~ 12s</Text>
+            <Text style={s.waitPillText}>Estimated Wait ~ 8s</Text>
           </View>
         </View>
 
-        {/* Cancel pinned to bottom */}
         <View style={s.searchBottom}>
           <TouchableOpacity style={s.cancelBtn} onPress={leave} activeOpacity={0.8}>
-            <Text style={s.cancelBtnText}>Cancel</Text>
+            <Text style={s.cancelBtnText}>Cancel Matchmaking</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -298,43 +449,58 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // SCREEN 04 — MATCH FOUND / VERSUS
+  // SCREEN: MATCH FOUND / VERSUS
   // ════════════════════════════════════════════════════════════════════════════
   if (screenState === 'VERSUS') {
     const cdSteps: (number | string)[] = [3, 2, 1, 'GO!'];
     const isActive = (step: number | string) => step === 'GO!' ? countdown === 0 : countdown === step;
 
+    // Slide animations for versus screen
+    const p1Translate = slideAnim.interpolate({ inputRange: [0, 1], outputRange: [-150, 0] });
+    const p2Translate = slideAnim.interpolate({ inputRange: [0, 1], outputRange: [150, 0] });
+    const vsScale = slideAnim.interpolate({ inputRange: [0, 1], outputRange: [0.1, 1] });
+
     return (
       <View style={s.versusRoot}>
-        {/* Top: label + players */}
+        {/* Top section: players intro */}
         <View style={s.versusTopSection}>
           <Text style={s.matchFoundLabel}>MATCH FOUND</Text>
 
           <View style={s.versusRow}>
-            <View style={s.versusPlayerCol}>
-              <AvatarSquare name={username} isMe size={72} />
+            <Animated.View style={[s.versusPlayerCol, { transform: [{ translateX: p1Translate }] }]}>
+              <AvatarSquare name={username} isMe size={76} />
               <Text style={s.versusPlayerName}>You</Text>
-              <Text style={s.versusPlayerRating}>{xp.toLocaleString()}</Text>
-            </View>
-            <View style={s.vsBubble}>
+              <Text style={[s.versusPlayerRating, { color: COLORS.primary }]}>{xp.toLocaleString()} XP</Text>
+            </Animated.View>
+
+            <Animated.View style={[s.vsBubble, { transform: [{ scale: vsScale }] }]}>
               <Text style={s.vsText}>VS</Text>
-            </View>
-            <View style={s.versusPlayerCol}>
-              <AvatarSquare name={oppName} color={oppColor} size={72} />
+            </Animated.View>
+
+            <Animated.View style={[s.versusPlayerCol, { transform: [{ translateX: p2Translate }] }]}>
+              <AvatarSquare name={oppName} color={oppColor} size={76} />
               <Text style={s.versusPlayerName}>
                 {(() => { const parts = oppName.split(' '); return parts.length > 1 ? `${parts[0]} ${parts[1]?.[0]}.` : parts[0]; })()}
               </Text>
-              <Text style={s.versusPlayerRating}>1,438</Text>
-            </View>
+              <Text style={[s.versusPlayerRating, { color: COLORS.accent }]}>1,438 XP</Text>
+            </Animated.View>
           </View>
         </View>
 
-        {/* Center: big countdown */}
+        {/* Center: massive spring countdown */}
         <View style={s.versusCenterSection}>
-          <Animated.Text style={[s.bigCountdown, { transform: [{ scale: cdScale }] }]}>
-            {countdown === 0 ? 'GO!' : countdown}
-          </Animated.Text>
-          <Text style={s.getReadyText}>Get ready...</Text>
+          {countdown === null ? (
+            <Text style={s.getReadyText}>Initializing game sync...</Text>
+          ) : (
+            <>
+              <Animated.Text style={[s.bigCountdown, { transform: [{ scale: cdScale }] }]}>
+                {countdown === 0 ? 'GO!' : countdown}
+              </Animated.Text>
+              <Text style={s.getReadyText}>
+                {countdown === 0 ? 'SOLVE AS FAST AS YOU CAN!' : 'GET READY...'}
+              </Text>
+            </>
+          )}
         </View>
 
         {/* Bottom: step indicators */}
@@ -350,108 +516,225 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // SCREEN 05 — PLAYING
+  // SCREEN: PLAYING
   // ════════════════════════════════════════════════════════════════════════════
   if (screenState === 'PLAYING') {
-    const myScore  = myPlayer?.score ?? 0;
-    const oppScore = oppPlayer?.score ?? 0;
-    const oppLabel = (oppName.split(' ')[0] ?? 'OPP').toUpperCase().slice(0, 5);
-    const timerPct = (questionTimer / 60) * 100;
-    const timerLabel = `${Math.floor(questionTimer / 60)}:${String(questionTimer % 60).padStart(2, '0')}`;
+    const oppLabel = (oppName.split(' ')[0] ?? 'OPP').toUpperCase().slice(0, 6);
+    
+    // Floating text interpolation
+    const floatMyY = myScoreAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -32] });
+    const floatMyOpacity = myScoreAnim.interpolate({ inputRange: [0, 0.2, 0.8, 1], outputRange: [0, 1, 1, 0] });
 
-    const NUMKEYS = [['1','2','3'],['4','5','6'],['7','8','9']];
+    const floatOppY = oppScoreAnim.interpolate({ inputRange: [0, 1], outputRange: [0, -32] });
+    const floatOppOpacity = oppScoreAnim.interpolate({ inputRange: [0, 0.2, 0.8, 1], outputRange: [0, 1, 1, 0] });
+
+    // Format equation string: split by operator/numbers to color "?"
+    const renderEquation = () => {
+      if (!questionText) return null;
+      if (questionText.includes('=')) {
+        const parts = questionText.split('=');
+        return (
+          <Text style={s.gameEquationText} numberOfLines={1} adjustsFontSizeToFit>
+            {parts[0]} = <Text style={{ color: COLORS.accent }}>?</Text>
+          </Text>
+        );
+      } else {
+        return (
+          <Text style={s.gameEquationText} numberOfLines={1} adjustsFontSizeToFit>
+            {questionText} = <Text style={{ color: COLORS.accent }}>?</Text>
+          </Text>
+        );
+      }
+    };
 
     return (
       <View style={s.gameRoot}>
-
-        {/* ── Fixed upper section: score cards + timer ── */}
-        <View style={s.gameTopSection}>
-          {/* Score cards row */}
-          <View style={s.topCardsRow}>
-            <View style={s.scoreCard}>
-              <Text style={[s.cardLabel, { color: COLORS.primary }]}>YOU</Text>
-              <Text style={[s.cardNum, { color: COLORS.primary }]}>{myScore}</Text>
-            </View>
-            <View style={[s.scoreCard, { alignItems: 'center' }]}>
-              <Text style={s.cardLabel}>ROUND</Text>
-              <Text style={[s.cardNum, { color: COLORS.text, fontSize: 22 }]}>{questionCount}/7</Text>
-            </View>
-            <View style={[s.scoreCard, { alignItems: 'flex-end' }]}>
-              <Text style={s.cardLabel}>{oppLabel}</Text>
-              <Text style={[s.cardNum, { color: COLORS.textSecondary }]}>{oppScore}</Text>
-            </View>
-          </View>
-
-          {/* Timer bar */}
-          <View style={s.timerRow}>
-            <View style={s.timerTrack}>
-              <View style={[s.timerFill, { width: `${timerPct}%` as any }]} />
-            </View>
-            <Text style={[s.timerLabel, questionTimer <= 10 && { color: '#F85149' }]}>{timerLabel}</Text>
+        {/* Round Outline Pill at top */}
+        <View style={s.roundPillContainer}>
+          <View style={s.roundPill}>
+            <Text style={s.roundPillText}>Round {questionCount} of 7</Text>
           </View>
         </View>
 
-        {/* ── Question card ── */}
-        <View style={s.questionCard}>
-          <Text style={s.solveItLabel}>SOLVE IT</Text>
-          <Text style={s.equationText} numberOfLines={1} adjustsFontSizeToFit>
-            {questionText} = ?
-          </Text>
-        </View>
-
-        {/* ── Answer field ── */}
-        <View style={[s.answerField, wrongFlash && s.answerFieldWrong]}>
-          <Text style={[s.answerNum, wrongFlash && { color: '#F85149' }]}>
-            {answerInput}
-            {answerInput.length > 0 && <Text style={{ color: COLORS.primary }}>|</Text>}
-          </Text>
-          {answerInput.length === 0 && <Text style={s.answerHint}>Your answer</Text>}
-        </View>
-
-        {/* ── Keypad — flex:1 fills ALL remaining space ── */}
-        <View style={s.keypadSection}>
-          {/* Number rows — each row flex:1 */}
-          {NUMKEYS.map((row, ri) => (
-            <View key={ri} style={s.keyRow}>
-              {row.map(k => (
-                <TouchableOpacity key={k} style={s.key} onPress={() => pressKey(k)} activeOpacity={0.6}>
-                  <Text style={s.keyText}>{k}</Text>
-                </TouchableOpacity>
+        {/* HUD: Score cards + Circular Timer */}
+        <View style={s.gameHUDRow}>
+          {/* Player Score Card */}
+          <View style={[
+            s.gameScoreCard, 
+            { borderColor: 'rgba(0, 212, 255, 0.25)' },
+            myScore >= oppScore && { 
+              borderColor: '#00D4FF',
+              shadowColor: '#00D4FF',
+              shadowOffset: { width: 0, height: 0 },
+              shadowOpacity: 0.35,
+              shadowRadius: 10,
+              elevation: 4,
+            }
+          ]}>
+            <View style={s.cardHeaderRow}>
+              <Text style={[s.gameCardLabel, { color: COLORS.accent }]}>YOU</Text>
+              <Animated.View style={[s.scoreFloater, { transform: [{ translateY: floatMyY }], opacity: floatMyOpacity }]}>
+                <Text style={s.scoreFloaterText}>+1</Text>
+              </Animated.View>
+            </View>
+            <Text style={[s.gameCardScoreText, { color: COLORS.accent }]}>{myScore}</Text>
+            
+            {/* Visual Indicators - 5 dots */}
+            <View style={s.dotRow}>
+              {Array.from({ length: 5 }).map((_, idx) => (
+                <View 
+                  key={idx} 
+                  style={[s.dotIndicator, idx < myScore ? { backgroundColor: COLORS.primary } : { backgroundColor: 'rgba(255,255,255,0.06)' }]} 
+                />
               ))}
             </View>
-          ))}
+          </View>
 
-          {/* Last row: ⌫  0  ✓ */}
-          <View style={s.keyRow}>
-            <TouchableOpacity style={s.key} onPress={() => pressKey('⌫')} activeOpacity={0.6}>
+          {/* Circular Timer */}
+          <View style={s.circularTimerWrapper}>
+            <View style={s.circularTimerRing}>
+              <Text style={s.circularTimerText}>{questionTimer}</Text>
+              <Text style={s.circularTimerSec}>SEC</Text>
+            </View>
+          </View>
+
+          {/* Opponent Score Card */}
+          <View style={[
+            s.gameScoreCard, 
+            { borderColor: 'rgba(139, 92, 246, 0.25)' },
+            oppScore >= myScore && { 
+              borderColor: '#8B5CF6',
+              shadowColor: '#8B5CF6',
+              shadowOffset: { width: 0, height: 0 },
+              shadowOpacity: 0.35,
+              shadowRadius: 10,
+              elevation: 4,
+            }
+          ]}>
+            <View style={s.cardHeaderRow}>
+              <Animated.View style={[s.scoreFloater, { transform: [{ translateY: floatOppY }], opacity: floatOppOpacity }]}>
+                <Text style={s.scoreFloaterText}>+1</Text>
+              </Animated.View>
+              <Text style={[s.gameCardLabel, { color: '#8B5CF6' }]}>{oppLabel}</Text>
+            </View>
+            <Text style={[s.gameCardScoreText, { color: '#8B5CF6' }]}>{oppScore}</Text>
+            
+            {/* Visual Indicators - 5 dots */}
+            <View style={s.dotRow}>
+              {Array.from({ length: 5 }).map((_, idx) => (
+                <View 
+                  key={idx} 
+                  style={[s.dotIndicator, idx < oppScore ? { backgroundColor: '#8B5CF6' } : { backgroundColor: 'rgba(255,255,255,0.06)' }]} 
+                />
+              ))}
+            </View>
+          </View>
+        </View>
+
+        {/* Equation Card */}
+        <View style={[
+          s.gameEquationCard,
+          correctFlash && s.gameEquationCardCorrect,
+          wrongFlash && s.gameEquationCardWrong
+        ]}>
+          <Text style={s.solveThisLabel}>SOLVE THIS</Text>
+          {renderEquation()}
+          
+          {/* LIVE status bar */}
+          <View style={s.liveStatusRow}>
+            <View style={s.liveStatusBadge}>
+              <View style={s.liveGreenDot} />
+              <Text style={s.liveStatusText}>LIVE</Text>
+            </View>
+            <Text style={s.typingStatusText}>
+              ● {oppName.split(' ')[0]} is typing...
+            </Text>
+          </View>
+        </View>
+
+        {/* Answer display box */}
+        <Animated.View style={[
+          s.answerDisplayCard, 
+          { transform: [{ translateX: shakeAnim }] }
+        ]}>
+          <Text style={s.answerDisplayText}>
+            {answerInput || <Text style={{ color: COLORS.textMuted }}>Your Answer</Text>}
+            {answerInput.length > 0 && <Text style={{ color: COLORS.primary }}>|</Text>}
+          </Text>
+        </Animated.View>
+
+        {/* Spacer to push keypad to the bottom */}
+        <View style={{ flex: 1 }} />
+
+        {/* Tactile Grid Keypad */}
+        <View style={s.newKeypadSection}>
+          <View style={s.newKeyRow}>
+            <TouchableOpacity style={s.newKey} onPress={() => pressKey('1')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>1</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.newKey} onPress={() => pressKey('2')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>2</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.newKey} onPress={() => pressKey('3')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>3</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={s.newKeyRow}>
+            <TouchableOpacity style={s.newKey} onPress={() => pressKey('4')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>4</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.newKey} onPress={() => pressKey('5')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>5</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.newKey} onPress={() => pressKey('6')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>6</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={s.newKeyRow}>
+            <TouchableOpacity style={s.newKey} onPress={() => pressKey('7')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>7</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.newKey} onPress={() => pressKey('8')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>8</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.newKey} onPress={() => pressKey('9')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>9</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={s.newKeyRow}>
+            <TouchableOpacity style={[s.newKey, { flex: 2 }]} onPress={() => pressKey('0')} activeOpacity={0.65}>
+              <Text style={s.newKeyText}>0</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[s.newKey, { flex: 1 }]} onPress={() => pressKey('⌫')} activeOpacity={0.65}>
               <Ionicons name="backspace-outline" size={24} color={COLORS.textSecondary} />
-            </TouchableOpacity>
-            <TouchableOpacity style={s.key} onPress={() => pressKey('0')} activeOpacity={0.6}>
-              <Text style={s.keyText}>0</Text>
-            </TouchableOpacity>
-            {/* ✓ emerald key */}
-            <TouchableOpacity
-              style={[s.key, { padding: 0, overflow: 'hidden', borderWidth: 0, borderRadius: 16 }]}
-              onPress={submit}
-              disabled={!answerInput}
-              activeOpacity={0.75}
-            >
-              <LinearGradient
-                colors={answerInput ? ['#0ECE8F', '#11D4A8'] : ['#1C2128', '#1C2128']}
-                start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
-                style={{ flex: 1, width: '100%', alignItems: 'center', justifyContent: 'center' }}
-              >
-                <Ionicons name="checkmark" size={30} color={answerInput ? '#0B1A14' : COLORS.textMuted} />
-              </LinearGradient>
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* Submit Button */}
+        <TouchableOpacity
+          style={s.newSubmitBtnWrapper}
+          onPress={submit}
+          disabled={!answerInput}
+          activeOpacity={0.8}
+        >
+          <LinearGradient
+            colors={answerInput ? ['#0ECE8F', '#00D4FF'] : ['#1C2128', '#1C2128']}
+            start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
+            style={s.newSubmitBtn}
+          >
+            <Ionicons name="checkmark-sharp" size={20} color={answerInput ? '#071510' : COLORS.textMuted} style={{ marginRight: 8 }} />
+            <Text style={[s.newSubmitBtnText, answerInput ? { color: '#071510', fontWeight: '900' } : { color: COLORS.textMuted }]}>
+              Submit Answer
+            </Text>
+          </LinearGradient>
+        </TouchableOpacity>
       </View>
     );
   }
 
   // ════════════════════════════════════════════════════════════════════════════
-  // SCREEN 06 — GAME OVER / WINNER
+  // SCREEN: GAME OVER / WINNER
   // ════════════════════════════════════════════════════════════════════════════
   if (screenState === 'GAME_OVER') {
     const isWin      = winnerId === socket?.id;
@@ -460,77 +743,98 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
     const oppShort   = (oppName.split(' ')[0] ?? 'OPP').toUpperCase();
     const totalRounds = myScore + oppScore;
 
+    const showAbort = opponentLeft && winnerId === null;
+
     return (
       <View style={s.gameOverRoot}>
         <View style={s.gameOverGlow} />
 
-        {/* Trophy ring + confetti */}
+        {/* Confetti + Trophy glowing wrapper */}
         <View style={s.trophyWrapper}>
-          <View style={[s.confettiPiece, { top: 4,  left: 28, backgroundColor: '#0ECE8F', transform: [{ rotate: '25deg' }] }]} />
-          <View style={[s.confettiPiece, { top: 0,  right: 32, backgroundColor: '#EC4899', width: 6, height: 16, transform: [{ rotate: '-30deg' }] }]} />
-          <View style={[s.confettiPiece, { top: 22, right: 10, backgroundColor: '#0ECE8F', width: 5, height: 12, transform: [{ rotate: '10deg' }] }]} />
-          <View style={[s.confettiPiece, { bottom: 8,  left: 16, backgroundColor: '#F59E0B', transform: [{ rotate: '40deg' }] }]} />
-          <View style={[s.confettiPiece, { bottom: 4,  right: 20, backgroundColor: '#8B5CF6', width: 5, height: 14, transform: [{ rotate: '-50deg' }] }]} />
-          <View style={[s.confettiPiece, { top: 44, left: 6, backgroundColor: '#F0F0F0', width: 4, height: 10, transform: [{ rotate: '60deg' }] }]} />
-
-          <View style={[s.trophyRing, { shadowColor: COLORS.primary, shadowOpacity: isWin ? 0.85 : 0.15, shadowRadius: 30, shadowOffset: { width: 0, height: 0 }, elevation: isWin ? 20 : 4 }]}>
+          <View style={[
+            s.trophyRing,
+            {
+              borderColor: isWin && !showAbort ? COLORS.primary : COLORS.border,
+              shadowColor: isWin && !showAbort ? COLORS.primary : '#000',
+              shadowOpacity: isWin && !showAbort ? 0.85 : 0.25,
+              shadowRadius: 30,
+              elevation: 15,
+            }
+          ]}>
             <View style={s.trophyInner}>
-              <Ionicons name={isWin ? 'star' : 'sad-outline'} size={46} color={isWin ? COLORS.primary : COLORS.textMuted} />
+              <Ionicons name={isWin && !showAbort ? 'trophy' : 'sad-outline'} size={48} color={isWin && !showAbort ? COLORS.gold : COLORS.textMuted} />
             </View>
           </View>
         </View>
 
-        {/* Result */}
-        {opponentLeft ? (
-          <><Text style={[s.winTitle, { color: COLORS.primary }]}>ABORTED</Text><Text style={s.winSub}>Opponent disconnected</Text></>
+        {/* Result Header */}
+        {showAbort ? (
+          <>
+            <Text style={[s.winTitle, { color: COLORS.primary }]}>ABORTED</Text>
+            <Text style={s.winSub}>Opponent disconnected and fled the arena</Text>
+          </>
         ) : (
           <>
-            <Text style={[s.winTitle, { color: isWin ? COLORS.primary : '#F85149' }]}>{isWin ? 'You Win!' : 'You Lose'}</Text>
-            <Text style={s.winSub}>{isWin ? `You beat ${oppName.split(' ')[0]} in ${totalRounds} rounds` : `${oppName.split(' ')[0]} beat you this time`}</Text>
+            <Text style={[s.winTitle, { color: isWin ? COLORS.primary : '#F85149' }]}>
+              {isWin ? 'VICTORY!' : 'DEFEATED'}
+            </Text>
+            <Text style={s.winSub}>
+              {isWin ? `You dominated ${oppName.split(' ')[0]} in ${totalRounds} rounds` : `${oppName.split(' ')[0]} won this match`}
+            </Text>
           </>
         )}
 
-        {/* Score card */}
+        {/* Final Score Dashboard */}
         <View style={s.finalCard}>
           <View style={s.finalScoreRow}>
             <View style={s.finalPlayerCol}>
               <Text style={s.finalLabel}>YOU</Text>
-              <Text style={[s.finalNum, { color: isWin ? COLORS.primary : COLORS.text }]}>{myScore}</Text>
+              <Text style={[s.finalNum, { color: isWin && !showAbort ? COLORS.primary : COLORS.text }]}>{myScore}</Text>
             </View>
-            <Text style={s.finalDash}>—</Text>
+            <Text style={s.finalDash}>VS</Text>
             <View style={s.finalPlayerCol}>
               <Text style={s.finalLabel}>{oppShort}</Text>
-              <Text style={[s.finalNum, { color: !isWin ? COLORS.primary : COLORS.text }]}>{oppScore}</Text>
+              <Text style={[s.finalNum, { color: !isWin && !showAbort ? COLORS.accent : COLORS.text }]}>{oppScore}</Text>
             </View>
           </View>
         </View>
 
-        {/* Rating pill */}
-        {!opponentLeft && (
+        {/* Rating adjustment pill */}
+        {!showAbort && (
           <View style={[s.ratingPill, { backgroundColor: isWin ? 'rgba(14,206,143,0.12)' : 'rgba(248,81,73,0.12)' }]}>
             <Text style={[s.ratingPillText, { color: isWin ? COLORS.primary : '#F85149' }]}>
-              {isWin ? `▲ +18 rating · now ${(xp + 18).toLocaleString()}` : `▼ -12 rating · now ${(xp - 12).toLocaleString()}`}
+              {ratingChange >= 0 ? `▲ +${ratingChange}` : `▼ ${ratingChange}`} Rating · Current Rating: {xp.toLocaleString()}
             </Text>
           </View>
         )}
 
-        {/* Play Again */}
-        {!opponentLeft && (
-          <TouchableOpacity onPress={() => socket?.emit('play_again')} disabled={!!myPlayer?.wantsPlayAgain} activeOpacity={0.84} style={s.playAgainWrapper}>
-            <LinearGradient
-              colors={myPlayer?.wantsPlayAgain ? ['#1C2128', '#1C2128'] : ['#0ECE8F', '#11D4A8']}
-              start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
-              style={s.playAgainBtn}
-            >
-              <Text style={[s.playAgainText, myPlayer?.wantsPlayAgain && { color: COLORS.textSecondary }]}>
-                {myPlayer?.wantsPlayAgain ? 'Waiting for opponent...' : 'Play Again'}
-              </Text>
-            </LinearGradient>
-          </TouchableOpacity>
+        {/* Play Again button with ready status indicator */}
+        {!showAbort && (
+          opponentLeft ? (
+            <View style={s.playAgainWrapper}>
+              <View style={[s.playAgainBtn, { backgroundColor: '#1C2128', borderColor: 'rgba(255,255,255,0.05)', borderWidth: 1 }]}>
+                <Text style={[s.playAgainText, { color: COLORS.textMuted }]}>
+                  Opponent Has Left
+                </Text>
+              </View>
+            </View>
+          ) : (
+            <TouchableOpacity onPress={() => socket?.emit('play_again')} disabled={!!myPlayer?.wantsPlayAgain} activeOpacity={0.85} style={s.playAgainWrapper}>
+              <LinearGradient
+                colors={myPlayer?.wantsPlayAgain ? ['#161B22', '#161B22'] : [COLORS.primary, COLORS.accent]}
+                start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
+                style={s.playAgainBtn}
+              >
+                <Text style={[s.playAgainText, myPlayer?.wantsPlayAgain && { color: COLORS.textSecondary }]}>
+                  {myPlayer?.wantsPlayAgain ? 'Waiting for opponent...' : 'Vote Rematch'}
+                </Text>
+              </LinearGradient>
+            </TouchableOpacity>
+          )
         )}
 
         <TouchableOpacity style={s.homeBtn} onPress={leave} activeOpacity={0.75}>
-          <Text style={s.homeBtnText}>Home</Text>
+          <Text style={s.homeBtnText}>Return to Lobby</Text>
         </TouchableOpacity>
       </View>
     );
@@ -542,8 +846,24 @@ export default function MentalScreen({ username, serverUrl, soundEnabled, vibrat
 // ════════════════════════════════════════════════════════════════════════════════
 // STYLES
 // ════════════════════════════════════════════════════════════════════════════════
-const s = StyleSheet.create({
+const { height: SCREEN_HEIGHT } = Dimensions.get('window');
+const isSmall = SCREEN_HEIGHT < 740;
 
+const SCALE = {
+  hudHeight: isSmall ? 78 : 92,
+  hudMargin: isSmall ? 8 : 20,
+  mathCardPadding: isSmall ? 18 : 28,
+  mathFontSize: isSmall ? 36 : 44,
+  answerHeight: isSmall ? 48 : 56,
+  answerMargin: isSmall ? 8 : 14,
+  keyRowHeight: isSmall ? 46 : 56,
+  keypadGap: isSmall ? 6 : 8,
+  keypadMargin: isSmall ? 4 : 8,
+  submitHeight: isSmall ? 48 : 56,
+  submitBottomMargin: Platform.OS === 'ios' ? (isSmall ? 14 : 28) : (isSmall ? 8 : 14),
+};
+
+const s = StyleSheet.create({
   // ── LOBBY ─────────────────────────────────────────────────────────────────
   lobbyRoot: {
     flex: 1,
@@ -613,35 +933,56 @@ const s = StyleSheet.create({
     backgroundColor: COLORS.primary, opacity: 0.5,
   },
   radarOuter: {
-    width: 230, height: 230, borderRadius: 115,
+    width: 240, height: 240, borderRadius: 120,
     backgroundColor: COLORS.surface,
     alignItems: 'center', justifyContent: 'center',
     marginBottom: 40,
+    position: 'relative',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.03)',
   },
-  radarArc: {
+  radarPulsingRing: {
     position: 'absolute',
-    width: 216, height: 216, borderRadius: 108,
-    borderWidth: 13, borderColor: COLORS.primary, borderTopColor: 'transparent',
+    width: 240, height: 240, borderRadius: 120,
+    borderWidth: 2,
+    borderColor: COLORS.primary,
+  },
+  radarSweep: {
+    position: 'absolute',
+    width: 220, height: 220, borderRadius: 110,
+    borderWidth: 8, borderColor: COLORS.primary, borderTopColor: 'transparent',
+    borderRightColor: 'transparent', opacity: 0.25,
+  },
+  radarMiddleRing: {
+    position: 'absolute',
+    width: 160, height: 160, borderRadius: 80,
+    borderWidth: 1, borderColor: COLORS.border, borderStyle: 'dashed',
+  },
+  radarInnerRing: {
+    position: 'absolute',
+    width: 90, height: 90, borderRadius: 45,
+    borderWidth: 1, borderColor: COLORS.border, opacity: 0.5,
   },
   radarCenter: {
-    width: 80, height: 80, borderRadius: 40,
+    width: 44, height: 44, borderRadius: 22,
     backgroundColor: COLORS.surfaceCard, alignItems: 'center', justifyContent: 'center',
+    zIndex: 10,
   },
-  radarDot: { width: 14, height: 14, borderRadius: 7, backgroundColor: COLORS.primary },
+  radarDot: { width: 12, height: 12, borderRadius: 6, backgroundColor: COLORS.primary },
   searchTitle: {
-    fontSize: 26, fontWeight: '700', color: COLORS.text,
-    textAlign: 'center', marginBottom: 10, lineHeight: 33,
+    fontSize: 26, fontWeight: '800', color: COLORS.text,
+    textAlign: 'center', marginBottom: 10, letterSpacing: -0.5,
   },
   searchSub: {
     fontSize: 14, color: COLORS.textSecondary,
-    textAlign: 'center', marginBottom: 28,
+    textAlign: 'center', marginBottom: 28, paddingHorizontal: 10,
   },
   waitPill: {
     backgroundColor: COLORS.surfaceCard, borderRadius: 28,
-    paddingVertical: 12, paddingHorizontal: 24,
+    paddingVertical: 10, paddingHorizontal: 22,
     borderWidth: 1, borderColor: COLORS.border,
   },
-  waitPillText: { fontSize: 14, color: COLORS.text, fontWeight: '500' },
+  waitPillText: { fontSize: 14, color: COLORS.text, fontWeight: '700' },
   searchBottom: { paddingBottom: Platform.OS === 'ios' ? 44 : 24 },
   cancelBtn: {
     width: '100%', height: 56,
@@ -649,7 +990,7 @@ const s = StyleSheet.create({
     borderRadius: 16, alignItems: 'center', justifyContent: 'center',
     borderWidth: 1, borderColor: COLORS.border,
   },
-  cancelBtnText: { fontSize: 16, fontWeight: '600', color: COLORS.text },
+  cancelBtnText: { fontSize: 16, fontWeight: '700', color: COLORS.text },
 
   // ── MATCH FOUND / VERSUS ──────────────────────────────────────────────────
   versusRoot: {
@@ -659,170 +1000,512 @@ const s = StyleSheet.create({
     alignItems: 'center', paddingTop: 48, paddingHorizontal: 32, width: '100%',
   },
   matchFoundLabel: {
-    fontSize: 12, fontWeight: '700', color: COLORS.primary,
-    letterSpacing: 3.5, marginBottom: 40,
+    fontSize: 12, fontWeight: '800', color: COLORS.primary,
+    letterSpacing: 4.5, marginBottom: 40,
   },
   versusRow: {
     flexDirection: 'row', alignItems: 'center',
     justifyContent: 'space-between', width: '100%',
   },
   versusPlayerCol: { alignItems: 'center', gap: 10, width: 110 },
-  versusPlayerName: { fontSize: 14, fontWeight: '600', color: COLORS.text, textAlign: 'center' },
-  versusPlayerRating: { fontSize: 12, color: COLORS.textSecondary },
+  versusPlayerName: { fontSize: 15, fontWeight: '700', color: COLORS.text, textAlign: 'center' },
+  versusPlayerRating: { fontSize: 12, fontWeight: '600' },
   vsBubble: {
-    width: 44, height: 44, borderRadius: 22,
+    width: 46, height: 46, borderRadius: 23,
     backgroundColor: COLORS.surfaceCard, borderWidth: 1, borderColor: COLORS.border,
     alignItems: 'center', justifyContent: 'center',
   },
-  vsText: { fontSize: 12, fontWeight: '700', color: COLORS.textSecondary },
+  vsText: { fontSize: 14, fontWeight: '800', color: COLORS.textSecondary },
 
-  // Big countdown in center
+  // Big countdown
   versusCenterSection: {
     flex: 1, alignItems: 'center', justifyContent: 'center',
   },
   bigCountdown: {
-    fontSize: 132, fontWeight: '800', color: COLORS.primary, lineHeight: 144, marginBottom: 8,
+    fontSize: 136, fontWeight: '900', color: COLORS.primary, lineHeight: 148, marginBottom: 8,
+    shadowColor: COLORS.primary, shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.5, shadowRadius: 20,
   },
-  getReadyText: { fontSize: 15, color: COLORS.textSecondary },
+  getReadyText: { fontSize: 14, color: COLORS.textSecondary, fontWeight: '700', letterSpacing: 1.5, textAlign: 'center' },
 
-  // Step indicators at bottom
   versusBottomSection: {
     paddingBottom: Platform.OS === 'ios' ? 52 : 32,
   },
   cdStepsRow: { flexDirection: 'row', gap: 18 },
-  cdStep: { fontSize: 14, color: COLORS.textMuted, fontWeight: '500' },
-  cdStepActive: { fontSize: 15, color: COLORS.primary, fontWeight: '700' },
+  cdStep: { fontSize: 14, color: COLORS.textMuted, fontWeight: '700' },
+  cdStepActive: { fontSize: 15, color: COLORS.primary, fontWeight: '900' },
 
-  // ── GAME SCREEN ───────────────────────────────────────────────────────────
+  // ── NEW GAME SCREEN DESIGN ─────────────────────────────────────────────────
   gameRoot: {
-    flex: 1, backgroundColor: COLORS.background,
-  },
-  gameTopSection: {
-    paddingHorizontal: 14, paddingTop: 12, gap: 10, marginBottom: 10,
-  },
-  topCardsRow: {
-    flexDirection: 'row', gap: 8, height: 76,
-  },
-  scoreCard: {
-    flex: 1, backgroundColor: COLORS.surface,
-    borderRadius: 14, paddingVertical: 10, paddingHorizontal: 12,
-    borderWidth: 1, borderColor: COLORS.border,
-    alignItems: 'flex-start', justifyContent: 'space-between',
-  },
-  cardLabel: {
-    fontSize: 9, fontWeight: '700',
-    color: COLORS.textMuted, letterSpacing: 1.3,
-  },
-  cardNum: { fontSize: 30, fontWeight: '800', lineHeight: 34 },
-
-  timerRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 10,
-  },
-  timerTrack: {
-    flex: 1, height: 4,
-    backgroundColor: COLORS.surfaceMedium, borderRadius: 2, overflow: 'hidden',
-  },
-  timerFill: {
-    height: '100%', backgroundColor: COLORS.primary, borderRadius: 2,
-  },
-  timerLabel: {
-    fontSize: 12, color: COLORS.textMuted, width: 34, textAlign: 'right',
-  },
-
-  // Question card
-  questionCard: {
-    backgroundColor: COLORS.surface, borderRadius: 18,
-    paddingVertical: 22, paddingHorizontal: 22,
-    marginHorizontal: 14, marginBottom: 10,
-    borderWidth: 1, borderColor: COLORS.border, alignItems: 'center',
-  },
-  solveItLabel: {
-    fontSize: 10, fontWeight: '700',
-    color: COLORS.textMuted, letterSpacing: 2.2, marginBottom: 12,
-  },
-  equationText: {
-    fontSize: 38, fontWeight: '800',
-    color: COLORS.text, letterSpacing: -0.5,
-  },
-
-  // Answer field
-  answerField: {
-    flexDirection: 'row', alignItems: 'center',
-    backgroundColor: COLORS.surface, borderRadius: 14,
-    borderWidth: 1.5, borderColor: COLORS.border,
-    paddingHorizontal: 18, height: 56, marginHorizontal: 14, marginBottom: 10,
-  },
-  answerFieldWrong: { borderColor: '#F85149' },
-  answerNum: { flex: 1, fontSize: 26, fontWeight: '600', color: COLORS.text },
-  answerHint: { fontSize: 13, color: COLORS.textMuted },
-
-  // ── Keypad: fills ALL remaining space with flex rows ──
-  keypadSection: {
     flex: 1,
+    backgroundColor: COLORS.background,
+  },
+  roundPillContainer: {
+    alignItems: 'center',
+    marginTop: 10,
+    marginBottom: 12,
+  },
+  roundPill: {
+    backgroundColor: 'rgba(255, 255, 255, 0.03)',
+    borderWidth: 1.2,
+    borderColor: COLORS.borderGlass,
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 5,
+  },
+  roundPillText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#8B5CF6', // Purple styled round tracker as seen in photo
+    letterSpacing: 0.5,
+  },
+  gameHUDRow: {
+    flexDirection: 'row',
     paddingHorizontal: 14,
-    paddingBottom: Platform.OS === 'ios' ? 28 : 14,
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: SCALE.hudMargin,
+    height: SCALE.hudHeight,
+  },
+  gameScoreCard: {
+    flex: 1,
+    backgroundColor: COLORS.surface,
+    borderRadius: 18,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderWidth: 1.5,
+    borderColor: COLORS.borderGlass,
+    justifyContent: 'space-between',
+    height: '100%',
+    position: 'relative',
+  },
+  scoreCardActiveBorder: {
+    borderColor: COLORS.border,
+  },
+  cardHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    width: '100%',
+  },
+  gameCardLabel: {
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+  },
+  gameCardScoreText: {
+    fontSize: 28,
+    fontWeight: '900',
+    lineHeight: 32,
+  },
+  dotRow: {
+    flexDirection: 'row',
+    gap: 3.5,
+  },
+  dotIndicator: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  circularTimerWrapper: {
+    marginHorizontal: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  circularTimerRing: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    borderWidth: 2.5,
+    borderColor: '#3B82F6',
+    shadowColor: '#3B82F6',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.5,
+    shadowRadius: 8,
+    elevation: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(7, 10, 19, 0.7)',
+  },
+  circularTimerInner: {
+    width: 66,
+    height: 66,
+    borderRadius: 33,
+    backgroundColor: '#070A13',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 1,
+  },
+  circularTimerText: {
+    fontSize: 22,
+    fontWeight: '900',
+    color: '#FFF',
+    lineHeight: 24,
+  },
+  circularTimerSec: {
+    fontSize: 8,
+    fontWeight: '800',
+    color: COLORS.textSecondary,
+    letterSpacing: 0.5,
+  },
+  gameEquationCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 22,
+    paddingVertical: SCALE.mathCardPadding,
+    paddingHorizontal: 22,
+    marginHorizontal: 14,
+    marginBottom: SCALE.hudMargin,
+    borderWidth: 1.5,
+    borderColor: 'rgba(0, 212, 255, 0.12)', // Subtle cyber cyan outline!
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    elevation: 4,
+  },
+  solveThisLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: COLORS.textSecondary,
+    letterSpacing: 3,
+    marginBottom: 12,
+  },
+  gameEquationText: {
+    fontSize: SCALE.mathFontSize, // Dynamic math equation text
+    fontWeight: '900',
+    color: COLORS.text,
+    letterSpacing: -0.5,
+  },
+  liveStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 14,
     gap: 8,
   },
-  keyRow: {
-    flex: 1, flexDirection: 'row', gap: 8,
+  liveStatusBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(14,206,143,0.12)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    gap: 4,
   },
-  key: {
+  liveGreenDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: COLORS.primary,
+  },
+  liveStatusText: {
+    fontSize: 9,
+    fontWeight: '800',
+    color: COLORS.primary,
+  },
+  typingStatusText: {
+    fontSize: 11,
+    color: COLORS.textMuted,
+    fontWeight: '600',
+  },
+  answerDisplayCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    height: SCALE.answerHeight,
+    marginHorizontal: 14,
+    marginBottom: SCALE.answerMargin,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  answerDisplayCardWrong: {
+    borderColor: '#F85149',
+  },
+  answerDisplayText: {
+    fontSize: 24,
+    fontWeight: '800',
+    color: COLORS.text,
+  },
+  newKeypadSection: {
+    paddingHorizontal: 14,
+    gap: SCALE.keypadGap,
+    marginBottom: SCALE.keypadMargin,
+    marginTop: SCALE.keypadMargin,
+  },
+  newKeyRow: {
+    flexDirection: 'row',
+    gap: SCALE.keypadGap,
+    height: SCALE.keyRowHeight, // Dynamic key row height
+  },
+  newKey: {
     flex: 1,
     backgroundColor: COLORS.surfaceCard,
-    borderRadius: 16, alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: COLORS.border,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 212, 255, 0.12)',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 3,
+    elevation: 2,
   },
-  keyText: { fontSize: 22, fontWeight: '600', color: COLORS.text },
+  newKeyText: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: COLORS.text,
+  },
+  newSubmitBtnWrapper: {
+    marginHorizontal: 14,
+    marginBottom: SCALE.submitBottomMargin,
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  newSubmitBtn: {
+    height: SCALE.submitHeight,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 16,
+  },
+  newSubmitBtnText: {
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  scoreFloater: {
+    position: 'absolute',
+    top: -6,
+    right: 2,
+    backgroundColor: COLORS.success,
+    borderRadius: 8,
+    paddingHorizontal: 5,
+    paddingVertical: 2,
+  },
+  scoreFloaterText: {
+    fontSize: 10,
+    fontWeight: '900',
+    color: '#0B1A14',
+  },
 
   // ── GAME OVER ─────────────────────────────────────────────────────────────
   gameOverRoot: {
     flex: 1, backgroundColor: COLORS.background,
     alignItems: 'center', justifyContent: 'center',
-    paddingHorizontal: 28, paddingBottom: Platform.OS === 'ios' ? 36 : 24,
+    paddingHorizontal: 24, paddingBottom: Platform.OS === 'ios' ? 36 : 24,
   },
   gameOverGlow: {
     position: 'absolute', top: -40,
-    left: '15%', right: '15%', height: 240,
-    backgroundColor: COLORS.primary, opacity: 0.07, borderRadius: 120,
+    left: '10%', right: '10%', height: 240,
+    backgroundColor: COLORS.primaryGlow, opacity: 0.1, borderRadius: 120,
   },
   trophyWrapper: {
     position: 'relative', alignItems: 'center', justifyContent: 'center',
     marginBottom: 24, width: 180, height: 180,
   },
-  confettiPiece: { position: 'absolute', width: 7, height: 18, borderRadius: 3 },
+  confettiPiece: { position: 'absolute', width: 3, height: 10, borderRadius: 1.5 },
   trophyRing: {
-    width: 142, height: 142, borderRadius: 71,
-    borderWidth: 10, borderColor: COLORS.primary,
+    width: 144, height: 144, borderRadius: 72,
+    borderWidth: 8,
     alignItems: 'center', justifyContent: 'center',
   },
   trophyInner: {
-    width: 96, height: 96, borderRadius: 48,
+    width: 98, height: 98, borderRadius: 49,
     backgroundColor: COLORS.surface, alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.borderGlass,
   },
-  winTitle: { fontSize: 44, fontWeight: '900', marginBottom: 8 },
-  winSub: { fontSize: 14, color: COLORS.textSecondary, marginBottom: 24, textAlign: 'center' },
+  winTitle: { fontSize: 38, fontWeight: '900', marginBottom: 8, letterSpacing: -0.5 },
+  winSub: { fontSize: 14, color: COLORS.textSecondary, marginBottom: 28, textAlign: 'center', paddingHorizontal: 10 },
   finalCard: {
-    width: '100%', backgroundColor: COLORS.surface, borderRadius: 18,
+    width: '100%', backgroundColor: COLORS.surface, borderRadius: 20,
     paddingVertical: 22, paddingHorizontal: 28,
-    borderWidth: 1, borderColor: COLORS.border, marginBottom: 14,
+    borderWidth: 1.5, borderColor: COLORS.border, marginBottom: 14,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.3, shadowRadius: 10,
   },
   finalScoreRow: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-around',
   },
   finalPlayerCol: { alignItems: 'center' },
   finalLabel: {
-    fontSize: 11, fontWeight: '700', color: COLORS.textMuted,
-    letterSpacing: 1.2, marginBottom: 6,
+    fontSize: 11, fontWeight: '800', color: COLORS.textSecondary,
+    letterSpacing: 1.5, marginBottom: 6,
   },
-  finalNum: { fontSize: 54, fontWeight: '800', lineHeight: 60 },
-  finalDash: { fontSize: 24, color: COLORS.border, fontWeight: '300' },
+  finalNum: { fontSize: 56, fontWeight: '900', lineHeight: 62 },
+  finalDash: { fontSize: 20, color: COLORS.textMuted, fontWeight: '800' },
   ratingPill: {
-    borderRadius: 10, paddingHorizontal: 16, paddingVertical: 10, marginBottom: 22,
+    borderRadius: 12, paddingHorizontal: 18, paddingVertical: 10, marginBottom: 24,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.03)',
   },
-  ratingPillText: { fontSize: 13, fontWeight: '600' },
-  playAgainWrapper: { width: '100%', borderRadius: 14, overflow: 'hidden', marginBottom: 10 },
-  playAgainBtn: { height: 56, alignItems: 'center', justifyContent: 'center', borderRadius: 14 },
-  playAgainText: { fontSize: 17, fontWeight: '700', color: '#0B1A14' },
+  ratingPillText: { fontSize: 13, fontWeight: '700' },
+  playAgainWrapper: { width: '100%', borderRadius: 16, overflow: 'hidden', marginBottom: 10 },
+  playAgainBtn: { height: 56, alignItems: 'center', justifyContent: 'center', borderRadius: 16 },
+  playAgainText: { fontSize: 17, fontWeight: '800', color: '#0B1A14' },
   homeBtn: { width: '100%', height: 50, alignItems: 'center', justifyContent: 'center' },
-  homeBtnText: { fontSize: 16, fontWeight: '600', color: COLORS.textSecondary },
+  homeBtnText: { fontSize: 16, fontWeight: '700', color: COLORS.textSecondary },
+
+  // New Lobby styling updates
+  newRatingCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 22,
+    borderWidth: 1.5,
+    borderColor: COLORS.borderGlass,
+    padding: 20,
+    marginTop: 20,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+    elevation: 3,
+  },
+  ratingLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: COLORS.textSecondary,
+    letterSpacing: 1.2,
+    marginBottom: 6,
+  },
+  ratingValueRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: 8,
+    marginBottom: 16,
+  },
+  ratingValueText: {
+    fontSize: 34,
+    fontWeight: '900',
+    color: COLORS.text,
+  },
+  ratingTrendText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: COLORS.primary,
+  },
+  statsCardRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  statsMiniCard: {
+    flex: 1,
+    backgroundColor: COLORS.surfaceCard,
+    borderRadius: 14,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.02)',
+  },
+  statsMiniVal: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: COLORS.text,
+    marginBottom: 2,
+  },
+  statsMiniSub: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: COLORS.textSecondary,
+  },
+  newDuelCard: {
+    borderRadius: 22,
+    overflow: 'hidden',
+    borderWidth: 1.5,
+    borderColor: '#0ECE8F', // Solid neon green outline!
+    backgroundColor: COLORS.surface,
+    shadowColor: '#0ECE8F',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 10,
+    elevation: 3,
+  },
+  newDuelCardGradient: {
+    padding: 20,
+  },
+  duelCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  duelIconWrapper: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: 'rgba(14,206,143,0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  duelTitle: {
+    fontSize: 20,
+    fontWeight: '900',
+    color: COLORS.text,
+    marginBottom: 4,
+  },
+  duelDesc: {
+    fontSize: 13,
+    color: COLORS.textSecondary,
+    lineHeight: 18,
+    marginBottom: 16,
+  },
+  lobbyPlayBtnWrapper: {
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  lobbyPlayBtn: {
+    height: 56,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 16,
+  },
+  lobbyPlayBtnTitle: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: '#0B1A14',
+    letterSpacing: 0.5,
+  },
+  lobbyPlayBtnSub: {
+    fontSize: 9,
+    fontWeight: '800',
+    color: '#0B1A14',
+    opacity: 0.8,
+  },
+  gameEquationCardCorrect: {
+    borderColor: COLORS.primary,
+    shadowColor: COLORS.primary,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.4,
+    shadowRadius: 12,
+    elevation: 5,
+  },
+  gameEquationCardWrong: {
+    borderColor: '#F85149',
+    shadowColor: '#F85149',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.4,
+    shadowRadius: 12,
+    elevation: 5,
+  },
+  liveBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(14,206,143,0.12)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    gap: 4,
+  },
+  liveDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: COLORS.primary,
+  },
+  liveText: {
+    fontSize: 9,
+    fontWeight: '800',
+    color: COLORS.primary,
+  },
 });
