@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
-import { COLORS, getInitials, getAvatarColor } from '../theme';
+import { COLORS, getInitials, getAvatarColor, getUserBadges, getTier } from '../theme';
 
 const { width } = Dimensions.get('window');
 
@@ -23,25 +23,21 @@ interface Entry {
   name: string;
   avatarColor: string;
   wins: number;
+  losses: number;
+  streak: number;
+  xp: number;
   rating: number;
   isMe?: boolean;
 }
 
-function getTier(xp: number): { title: string; color: string; bg: string } {
-  if (xp >= 2200) return { title: 'GRANDMASTER', color: '#F472B6', bg: 'rgba(244,114,182,0.12)' };
-  if (xp >= 2000) return { title: 'MASTER', color: '#A78BFA', bg: 'rgba(167,139,250,0.12)' };
-  if (xp >= 1800) return { title: 'DIAMOND', color: '#00D4FF', bg: 'rgba(0, 212, 255, 0.12)' };
-  if (xp >= 1500) return { title: 'PLATINUM', color: '#2DD4BF', bg: 'rgba(45,212,191,0.12)' };
-  if (xp >= 1200) return { title: 'GOLD', color: '#FBBF24', bg: 'rgba(251,191,36,0.12)' };
-  return { title: 'BRONZE', color: '#F59E0B', bg: 'rgba(245,158,11,0.1)' };
-}
-
-type Filter = 'Global' | 'Friends' | 'Weekly';
 
 interface Props {
   currentUsername: string;
   currentUserXP: number;
+  currentUserRank: number;
   wins: number;
+  losses: number;
+  streak: number;
   serverUrl: string;
   jwtToken: string | null;
   onBack: () => void;
@@ -51,22 +47,25 @@ interface Props {
 function Avatar({
   name, color, size, ringColor,
 }: { name: string; color: string; size: number; ringColor?: string }) {
+  const hasCustom = color && color.includes(':');
+  const bg = hasCustom ? color.split(':')[0] : color;
+  const symbol = hasCustom ? color.split(':')[1] : getInitials(name);
+
   return (
     <View style={ringColor ? { padding: 3, borderRadius: (size + 8) / 2, borderWidth: 2.5, borderColor: ringColor, shadowColor: ringColor, shadowOpacity: 0.35, shadowRadius: 8 } : undefined}>
       <View style={{
         width: size, height: size, borderRadius: size / 2,
-        backgroundColor: color, alignItems: 'center', justifyContent: 'center',
+        backgroundColor: bg, alignItems: 'center', justifyContent: 'center',
       }}>
-        <Text style={{ fontSize: size * 0.36, fontWeight: '800', color: '#FFF' }}>
-          {getInitials(name)}
+        <Text style={{ fontSize: size * (hasCustom ? 0.48 : 0.36), fontWeight: '800', color: '#FFF' }}>
+          {symbol}
         </Text>
       </View>
     </View>
   );
 }
 
-export default function LeaderboardScreen({ currentUsername, currentUserXP, wins, serverUrl, jwtToken, onBack }: Props) {
-  const [filter, setFilter] = useState<Filter>('Global');
+export default function LeaderboardScreen({ currentUsername, currentUserXP, currentUserRank, wins, losses, streak, serverUrl, jwtToken, onBack }: Props) {
   const [roster, setRoster] = useState<Entry[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -78,12 +77,15 @@ export default function LeaderboardScreen({ currentUsername, currentUserXP, wins
       if (res.ok) {
         const data = await res.json();
         const mapped: Entry[] = data.leaderboard.map((u: any, idx: number) => ({
-          id: u.id,
+          id: idx,
           rank: idx + 1,
           name: u.username,
-          avatarColor: getAvatarColor(u.username),
+          avatarColor: u.avatar_color || getAvatarColor(u.username),
           wins: u.wins,
-          rating: u.xp,
+          losses: u.losses ?? 0,
+          streak: u.streak ?? 0,
+          xp: u.xp ?? 0,
+          rating: u.rating ?? 1000,
           isMe: u.username === currentUsername,
         }));
         setRoster(mapped);
@@ -105,11 +107,14 @@ export default function LeaderboardScreen({ currentUsername, currentUserXP, wins
   if (!myEntryInRoster && roster.length > 0 && !loading) {
     const myEntry: Entry = {
       id: -1,
-      rank: 999, // Unranked / below top 20
+      rank: currentUserRank,
       name: currentUsername,
       avatarColor: COLORS.primary,
       wins,
-      rating: currentUserXP,
+      losses,
+      streak,
+      xp: currentUserXP,
+      rating: 1000, // fallback — actual rating not passed as prop yet
       isMe: true,
     };
     finalRoster.push(myEntry);
@@ -119,9 +124,6 @@ export default function LeaderboardScreen({ currentUsername, currentUserXP, wins
   
   // display order: rank2 (left) | rank1 (center) | rank3 (right)
   const podiumOrder = podium.length >= 3 ? [podium[1]!, podium[0]!, podium[2]!] : [];
-  const podiumColors = ['#00D4FF', '#0ECE8F', '#8B5CF6'] as const;
-  const heights = [100, 130, 85] as const; // Pedestal heights for e-sports look
-
   const listRows = finalRoster.length >= 3 ? finalRoster.slice(3) : finalRoster;
 
   return (
@@ -131,22 +133,7 @@ export default function LeaderboardScreen({ currentUsername, currentUserXP, wins
         <TouchableOpacity onPress={onBack} style={s.backBtn} activeOpacity={0.7}>
           <Ionicons name="chevron-back" size={24} color={COLORS.text} />
         </TouchableOpacity>
-        <Ionicons name="trophy" size={26} color={COLORS.gold} style={{ marginRight: 6 }} />
         <Text style={s.title}>Leaderboard</Text>
-      </View>
-
-      {/* ── Filter tabs ── */}
-      <View style={s.filterRow}>
-        {(['Global', 'Friends', 'Weekly'] as Filter[]).map((f) => (
-          <TouchableOpacity
-            key={f}
-            style={[s.filterTab, filter === f && s.filterActive]}
-            onPress={() => setFilter(f)}
-            activeOpacity={0.8}
-          >
-            <Text style={[s.filterText, filter === f && s.filterTextActive]}>{f}</Text>
-          </TouchableOpacity>
-        ))}
       </View>
 
       {loading ? (
@@ -168,80 +155,121 @@ export default function LeaderboardScreen({ currentUsername, currentUserXP, wins
           {/* ── Podium Arena ── */}
           {podiumOrder.length === 3 && (
             <View style={s.podiumWrap}>
-              {podiumOrder.map((entry, i) => {
-                const color = podiumColors[i]!;
-                const height = heights[i]!;
-                const isFirst = i === 1;
-                const avatarSize = isFirst ? 72 : 58;
+              {podiumOrder.map((entry) => {
+                const isFirst = entry.rank === 1;
+                const isSecond = entry.rank === 2;
+                const isThird = entry.rank === 3;
+                
+                const avatarSize = isFirst ? 64 : 52;
+                const ringColor = isFirst ? COLORS.primary : (isSecond ? COLORS.accent : COLORS.textSecondary);
+                const badgeBg = isFirst ? COLORS.primary : (isSecond ? COLORS.accent : COLORS.textSecondary);
+                const badgeTextColor = isFirst ? '#071510' : (isSecond ? '#08252e' : '#FFF');
+                const pointsColor = isFirst ? COLORS.primary : (isSecond ? COLORS.accent : COLORS.textSecondary);
 
                 return (
                   <View key={entry.rank} style={s.podiumCol}>
-                    <View style={s.podiumAvatarWrap}>
-                      <Avatar name={entry.name} color={entry.avatarColor} size={avatarSize} ringColor={color} />
-                      {isFirst && (
-                        <View style={s.crownIcon}>
-                          <Ionicons name="ribbon" size={16} color="#0ECE8F" />
+                    {isFirst ? (
+                      /* Rank 1: Defined container with background shade (no border) */
+                      <View
+                        style={[
+                          s.podiumCard,
+                          {
+                            height: 130,
+                            backgroundColor: 'rgba(0, 212, 255, 0.08)', // Visible theme cyan background shade
+                          }
+                        ]}
+                      >
+                        <Text style={{ fontSize: 18, marginBottom: 4 }}>👑</Text>
+                        
+                        {/* Avatar Wrap */}
+                        <View style={s.podiumAvatarWrap}>
+                          <View style={[
+                            s.podiumAvatarRing,
+                            { borderColor: ringColor, width: avatarSize + 6, height: avatarSize + 6, borderRadius: (avatarSize + 6) / 2 }
+                          ]}>
+                            <Avatar name={entry.name} color={entry.avatarColor} size={avatarSize} />
+                          </View>
+                          {/* Rank Badge */}
+                          <View style={[s.podiumBadge, { backgroundColor: badgeBg }]}>
+                            <Text style={[s.podiumBadgeText, { color: badgeTextColor }]}>{entry.rank}</Text>
+                          </View>
                         </View>
-                      )}
-                    </View>
-
-                    <Text style={s.podiumName} numberOfLines={1}>{entry.name}</Text>
-                    
-                    {/* 3D Pillar Pedestal */}
-                    <LinearGradient
-                      colors={isFirst ? ['rgba(14,206,143,0.18)', 'rgba(14,206,143,0.03)'] : (i === 0 ? ['rgba(0,212,255,0.14)', 'rgba(0,212,255,0.02)'] : ['rgba(139,92,246,0.14)', 'rgba(139,92,246,0.02)'])}
-                      style={[s.pedestal, { height, borderColor: color }]}
-                    >
-                      <Text style={[s.pedestalRankText, { color }]}>{entry.rank}</Text>
-                      
-                      {/* Small tier badge on pedestal */}
-                      <View style={[s.podiumTierBadge, { backgroundColor: getTier(entry.rating).bg, borderColor: getTier(entry.rating).color }]}>
-                        <Text style={[s.podiumTierText, { color: getTier(entry.rating).color }]}>
-                          {getTier(entry.rating).title}
-                        </Text>
                       </View>
+                    ) : (
+                      /* Rank 2 & 3: Floating with no defined boundary card background */
+                      <View style={s.floatingPodiumWrapper}>
+                        {/* Avatar Wrap */}
+                        <View style={s.podiumAvatarWrap}>
+                          <View style={[
+                            s.podiumAvatarRing,
+                            { borderColor: ringColor, width: avatarSize + 6, height: avatarSize + 6, borderRadius: (avatarSize + 6) / 2 }
+                          ]}>
+                            <Avatar name={entry.name} color={entry.avatarColor} size={avatarSize} />
+                          </View>
+                          {/* Rank Badge */}
+                          <View style={[s.podiumBadge, { backgroundColor: badgeBg }]}>
+                            <Text style={[s.podiumBadgeText, { color: badgeTextColor }]}>{entry.rank}</Text>
+                          </View>
+                        </View>
+                      </View>
+                    )}
 
-                      <Text style={[s.podiumPts, isFirst && { color: '#0ECE8F', fontWeight: '800' }]}>
-                        {entry.rating.toLocaleString()}
-                      </Text>
-                      <Text style={s.podiumWinsText}>{entry.wins} wins</Text>
-                    </LinearGradient>
+                    {/* Name, tier & rating below card */}
+                    <Text style={s.podiumName} numberOfLines={1}>{entry.name}</Text>
+                    <Text style={[s.podiumTier, { color: getTier(entry.rating).color }]}>
+                      {getTier(entry.rating).label}
+                    </Text>
+                    <Text style={[s.podiumPts, { color: pointsColor }]}>
+                      {entry.rating.toLocaleString()} MMR
+                    </Text>
                   </View>
                 );
               })}
             </View>
           )}
 
+          {/* ── Empty state ── */}
+          {finalRoster.length === 0 && (
+            <View style={s.emptyWrap}>
+              <Ionicons name="trophy-outline" size={48} color={COLORS.textMuted} />
+              <Text style={s.emptyTitle}>No players yet</Text>
+              <Text style={s.emptySub}>Play a match to appear on the leaderboard</Text>
+            </View>
+          )}
+
           {/* ── Ranked list 4+ ── */}
-          <Text style={s.sectionTitle}>RANKINGS</Text>
+          {finalRoster.length > 0 && <Text style={s.sectionTitle}>RANKINGS</Text>}
           <View style={s.listWrap}>
             {listRows.map((entry) => (
               <View key={entry.id} style={[s.row, entry.isMe && s.rowMe]}>
-                <Text style={[s.rowRank, entry.isMe && { color: '#00D4FF' }]}>
+                <Text style={[s.rowRank, entry.isMe && { color: COLORS.accent }]}>
                   {entry.rank === 999 ? '-' : entry.rank}
                 </Text>
-                <Avatar name={entry.name} color={entry.avatarColor} size={42} />
+                <Avatar name={entry.name} color={entry.avatarColor} size={40} />
                 <View style={s.rowInfo}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 2 }}>
-                    <Text style={[s.rowName, entry.isMe && { color: '#00D4FF' }]}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    <Text style={[s.rowName, entry.isMe && { color: COLORS.accent }]} numberOfLines={1}>
                       {entry.name}
                     </Text>
-                    <View style={[s.tierBadge, { backgroundColor: getTier(entry.rating).bg, borderColor: getTier(entry.rating).color }]}>
+                    {entry.isMe && (
+                      <View style={s.youBadge}><Text style={s.youBadgeText}>YOU</Text></View>
+                    )}
+                  </View>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 2 }}>
+                    <View style={[s.tierBadge, { backgroundColor: getTier(entry.rating).bg }]}>
                       <Text style={[s.tierBadgeText, { color: getTier(entry.rating).color }]}>
-                        {getTier(entry.rating).title}
+                        {getTier(entry.rating).label}
                       </Text>
                     </View>
+                    <Text style={s.rowWins}>{entry.wins}W · {entry.losses}L</Text>
                   </View>
-                  <Text style={s.rowWins}>{entry.wins} Victories</Text>
                 </View>
-                <Text style={[s.rowRating, entry.isMe && { color: '#00D4FF' }]}>
-                  {entry.rating.toLocaleString()} XP
-                </Text>
-                {entry.isMe && (
-                  <View style={s.youBadge}>
-                    <Text style={s.youBadgeText}>YOU</Text>
-                  </View>
-                )}
+                <View style={s.rowRight}>
+                  <Text style={[s.rowRating, entry.isMe && { color: COLORS.accent }]}>
+                    {entry.rating.toLocaleString()}
+                  </Text>
+                  <Text style={s.rowXp}>{entry.xp.toLocaleString()} XP</Text>
+                </View>
               </View>
             ))}
           </View>
@@ -280,24 +308,7 @@ const s = StyleSheet.create({
   },
   title: { fontSize: 24, fontWeight: '800', color: COLORS.text, letterSpacing: -0.5 },
 
-  // ── Filters
-  filterRow: {
-    flexDirection: 'row',
-    paddingHorizontal: 18,
-    gap: 8,
-    marginBottom: 10,
-  },
-  filterTab: {
-    paddingVertical: 7,
-    paddingHorizontal: 18,
-    borderRadius: 22,
-    backgroundColor: COLORS.surfaceCard,
-    borderWidth: 1.5,
-    borderColor: COLORS.border,
-  },
-  filterActive: { backgroundColor: '#0ECE8F', borderColor: '#0ECE8F' },
-  filterText: { fontSize: 13, fontWeight: '700', color: COLORS.textSecondary },
-  filterTextActive: { color: '#071510', fontWeight: '800' },
+
 
   scroll: { paddingHorizontal: 16, paddingTop: 10 },
 
@@ -306,48 +317,65 @@ const s = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-end',
     justifyContent: 'center',
-    paddingVertical: 20,
-    gap: 12,
+    paddingVertical: 10,
+    gap: 10,
     marginBottom: 20,
+    marginTop: 10,
   },
   podiumCol: {
     alignItems: 'center',
-    flex: 1,
-    position: 'relative',
+    width: 96,
   },
-  podiumAvatarWrap: { position: 'relative', marginBottom: 8 },
-  crownIcon: {
-    position: 'absolute',
-    top: -10,
-    alignSelf: 'center',
-    backgroundColor: COLORS.background,
-    borderRadius: 10,
-    padding: 2,
-  },
-  podiumName: { fontSize: 13, fontWeight: '800', color: COLORS.text, textAlign: 'center', marginBottom: 8, width: '100%' },
-  
-  // Podium Pillar Column
-  pedestal: {
-    width: '100%',
-    borderRadius: 16,
+  podiumCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
-    borderWidth: 1.5,
-    paddingVertical: 10,
-    gap: 2,
+    width: '100%',
+    position: 'relative',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.15,
+    shadowOpacity: 0.12,
     shadowRadius: 6,
     elevation: 3,
+    marginBottom: 10,
   },
-  pedestalRankText: {
-    fontSize: 22,
+  floatingPodiumWrapper: {
+    width: '100%',
+    height: 130,
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    paddingBottom: 10,
+    marginBottom: 10,
+  },
+  podiumAvatarWrap: {
+    position: 'relative',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  podiumAvatarRing: {
+    borderWidth: 2.5,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  podiumBadge: {
+    position: 'absolute',
+    bottom: -6,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: COLORS.surface,
+  },
+  podiumBadgeText: {
+    fontSize: 10,
     fontWeight: '900',
-    opacity: 0.85,
   },
-  podiumPts: { fontSize: 14, color: COLORS.textSecondary, fontWeight: '700' },
-  podiumWinsText: { fontSize: 10, color: COLORS.textMuted, fontWeight: '600' },
+  podiumName: { fontSize: 13, fontWeight: '800', color: COLORS.text, textAlign: 'center', marginBottom: 2, width: '100%' },
+  podiumTier: { fontSize: 9, fontWeight: '800', letterSpacing: 0.8, textAlign: 'center', marginBottom: 2 },
+  podiumPts: { fontSize: 12, fontWeight: '700' },
 
   sectionTitle: {
     fontSize: 11,
@@ -358,67 +386,80 @@ const s = StyleSheet.create({
     marginLeft: 4,
   },
 
-  // ── List rows (With defined borders!)
+  // ── List rows
   listWrap: { gap: 10 },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: COLORS.surface,
+    backgroundColor: 'rgba(0, 212, 255, 0.08)',
     borderRadius: 16,
-    paddingHorizontal: 14,
+    paddingHorizontal: 16,
     paddingVertical: 14,
     gap: 12,
-    borderWidth: 1.5,
-    borderColor: COLORS.border,
   },
   rowMe: {
-    borderWidth: 1.5,
-    borderColor: '#00D4FF',
-    backgroundColor: 'rgba(0, 212, 255, 0.05)',
+    borderWidth: 1.2,
+    borderColor: 'rgba(0, 212, 255, 0.35)',
+    backgroundColor: 'rgba(0, 212, 255, 0.02)',
   },
   rowRank: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '800',
     color: COLORS.textSecondary,
     width: 22,
     textAlign: 'center',
   },
   rowInfo: { flex: 1 },
-  rowName: { fontSize: 15, fontWeight: '700', color: COLORS.text, marginBottom: 2 },
+  rowName: { fontSize: 15, fontWeight: '600', color: COLORS.text, marginBottom: 2 },
   rowWins: { fontSize: 12, color: COLORS.textSecondary, fontWeight: '500' },
-  rowRating: { fontSize: 14, fontWeight: '800', color: COLORS.primary },
+  rowRight: {
+    flexDirection: 'column',
+    alignItems: 'flex-end',
+    alignItems: 'center',
+    gap: 8,
+  },
+  rowRating: { fontSize: 15, fontWeight: '800', color: COLORS.accent, textAlign: 'right' },
+  rowXp: { fontSize: 11, fontWeight: '600', color: COLORS.textMuted, textAlign: 'right' },
+  tierBadge: { borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
+  tierBadgeText: { fontSize: 9, fontWeight: '800', letterSpacing: 0.6 },
   youBadge: {
-    backgroundColor: 'rgba(0,212,255,0.12)',
+    backgroundColor: 'rgba(0, 212, 255, 0.08)',
     borderRadius: 8,
     paddingHorizontal: 8,
-    paddingVertical: 4,
+    paddingVertical: 3,
     borderWidth: 1,
-    borderColor: 'rgba(0,212,255,0.25)',
+    borderColor: 'rgba(0, 212, 255, 0.25)',
   },
-  youBadgeText: { fontSize: 10, fontWeight: '800', color: '#00D4FF' },
-  
-  // Tier Badges Styles
-  tierBadge: {
+  youBadgeText: { fontSize: 9, fontWeight: '800', color: '#00D4FF' },
+  miniBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 6,
-    borderWidth: 1,
-  },
-  tierBadgeText: {
-    fontSize: 8,
-    fontWeight: '900',
-    letterSpacing: 0.3,
-  },
-  podiumTierBadge: {
-    paddingHorizontal: 5,
-    paddingVertical: 2,
-    borderRadius: 4,
     borderWidth: 0.8,
-    marginVertical: 4,
   },
-  podiumTierText: {
-    fontSize: 7,
-    fontWeight: '900',
-    letterSpacing: 0.2,
+  miniBadgeText: {
+    fontSize: 7.5,
+    fontWeight: '800',
+  },
+  emptyWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 60,
+    gap: 12,
+  },
+  emptyTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: COLORS.textSecondary,
+  },
+  emptySub: {
+    fontSize: 13,
+    color: COLORS.textMuted,
+    textAlign: 'center',
+    paddingHorizontal: 40,
+    lineHeight: 18,
   },
 });

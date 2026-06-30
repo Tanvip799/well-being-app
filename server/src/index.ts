@@ -5,9 +5,7 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import jwt from 'jsonwebtoken';
-import bcrypt from 'bcrypt';
-import { pool, initDB } from './db';
+import { createClient } from '@supabase/supabase-js';
 import { generateQuestion, MathQuestion } from './utils/mathGenerator';
 
 const app = express();
@@ -19,92 +17,291 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
-const JWT_SECRET = process.env.JWT_SECRET!;
-const SALT_ROUNDS = 10;
+const SUPABASE_URL = process.env.SUPABASE_URL!;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+
+// ── DB client — service role, used ONLY for database queries.
+// Never call supabase.auth.* on this client; doing so can set a user JWT
+// as the session context which makes subsequent DB inserts subject to RLS
+// even though the service role key normally bypasses it.
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+});
+
+// ── Auth client — separate instance, used ONLY for auth operations
+// (getUser, signInWithOtp, verifyOtp, refreshSession).
+// Auth state contamination here is isolated and cannot affect DB operations.
+const authClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+});
+
+// ─── Simple in-memory rate limiter ────────────────────────────────────────────
+const rateLimitWindows = new Map<string, { count: number; resetAt: number }>();
+function rateLimit(key: string, maxRequests: number, windowMs: number): boolean {
+  const now = Date.now();
+  const entry = rateLimitWindows.get(key);
+  if (!entry || now > entry.resetAt) {
+    rateLimitWindows.set(key, { count: 1, resetAt: now + windowMs });
+    return true; // allowed
+  }
+  if (entry.count >= maxRequests) return false; // blocked
+  entry.count++;
+  return true;
+}
+// Clean up stale entries every 10 minutes to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimitWindows) { if (now > v.resetAt) rateLimitWindows.delete(k); }
+}, 10 * 60 * 1000);
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => { res.json({ status: 'ok' }); });
 
-// ─── Auth: Register ────────────────────────────────────────────────────────────
-app.post('/auth/register', async (req, res) => {
-  const { username, password } = req.body as { username: string; password: string };
+// ─── Auth: Send OTP ────────────────────────────────────────────────────────────
+app.post('/auth/send-otp', async (req, res) => {
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.socket.remoteAddress ?? 'unknown';
+  if (!rateLimit(`otp-send:${ip}`, 5, 15 * 60 * 1000)) {
+    return res.status(429).json({ error: 'Too many requests. Please wait before requesting another code.' });
+  }
 
-  if (!username?.trim() || !password) {
-    return res.status(400).json({ error: 'Username and password are required.' });
-  }
-  if (username.trim().length < 3) {
-    return res.status(400).json({ error: 'Username must be at least 3 characters.' });
-  }
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  const { email } = req.body as { email: string };
+
+  if (!email?.trim()) {
+    return res.status(400).json({ error: 'Email is required.' });
   }
 
   try {
-    const clean = username.trim().slice(0, 20);
-    const existing = await pool.query('SELECT id FROM users WHERE username = $1', [clean]);
-    if (existing.rows.length > 0) {
+    const cleanEmail = email.trim().toLowerCase();
+    const { error } = await authClient.auth.signInWithOtp({
+      email: cleanEmail,
+      options: {
+        shouldCreateUser: true,
+      },
+    });
+
+    if (error) {
+      console.error('Error sending OTP:', error);
+      return res.status(400).json({ error: error.message });
+    }
+
+    console.log(`✉️ OTP sent to: ${cleanEmail.replace(/(.{2}).+(@.+)/, '$1***$2')}`);
+    return res.json({ success: true, message: 'OTP code has been sent to your email.' });
+  } catch (err) {
+    console.error('Send OTP error:', err);
+    return res.status(500).json({ error: 'Server error sending OTP.' });
+  }
+});
+
+// ─── Auth: Verify OTP ───────────────────────────────────────────────────────────
+app.post('/auth/verify-otp', async (req, res) => {
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.socket.remoteAddress ?? 'unknown';
+  // Rate limit per IP (10/15min) AND per email address (5/15min) to block brute-force guessing
+  if (!rateLimit(`otp-verify:ip:${ip}`, 10, 15 * 60 * 1000) ||
+      !rateLimit(`otp-verify:email:${(req.body?.email ?? '').toLowerCase()}`, 5, 15 * 60 * 1000)) {
+    return res.status(429).json({ error: 'Too many attempts. Please wait before trying again.' });
+  }
+
+  const { email, otp } = req.body as { email: string; otp: string };
+
+  if (!email?.trim() || !otp?.trim()) {
+    return res.status(400).json({ error: 'Email and OTP code are required.' });
+  }
+
+  try {
+    const cleanEmail = email.trim().toLowerCase();
+    const { data, error } = await authClient.auth.verifyOtp({
+      email: cleanEmail,
+      token: otp.trim(),
+      type: 'email',
+    });
+
+    if (error || !data.session) {
+      console.error('OTP verification error:', error);
+      return res.status(401).json({ error: error?.message || 'Invalid or expired OTP code.' });
+    }
+
+    const { access_token, user } = data.session;
+    const userId = user.id;
+
+    // Check if the user already has a public profile (duelist tag + stats) configured
+    const { data: profile } = await supabase
+      .from('users')
+      .select('id, username, xp, rating, wins, losses, streak, avatar_color')
+      .eq('id', userId)
+      .maybeSingle();
+
+    const hasConfiguredProfile = !!(profile && profile.username && profile.username.trim().length > 0);
+    console.log(`✅ OTP Verified. userId=${userId} hasProfile=${hasConfiguredProfile}`);
+
+    return res.json({
+      token: access_token,
+      refreshToken: data.session.refresh_token,
+      profileExists: hasConfiguredProfile,
+      user: hasConfiguredProfile ? profile : null,
+    });
+  } catch (err) {
+    console.error('Verify OTP error:', err);
+    return res.status(500).json({ error: 'Server error during OTP verification.' });
+  }
+});
+
+// ─── Auth: Refresh Token ────────────────────────────────────────────────────────
+app.post('/auth/refresh', async (req, res) => {
+  const { refreshToken } = req.body as { refreshToken: string };
+  if (!refreshToken) return res.status(400).json({ error: 'No refresh token provided' });
+
+  try {
+    const { data, error } = await authClient.auth.refreshSession({ refresh_token: refreshToken });
+    if (error || !data.session) {
+      return res.status(401).json({ error: 'Session expired. Please sign in again.' });
+    }
+    return res.json({
+      token: data.session.access_token,
+      refreshToken: data.session.refresh_token,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Server error during token refresh.' });
+  }
+});
+
+// ─── Auth: Create Profile ───────────────────────────────────────────────────────
+app.post('/auth/create-profile', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  const payload = await verifyToken(token);
+  if (!payload) return res.status(401).json({ error: 'Invalid or expired token' });
+
+  const { username, avatarColor } = req.body as { username: string; avatarColor: string };
+  if (!username?.trim() || username.trim().length < 3) {
+    return res.status(400).json({ error: 'Username must be at least 3 characters.' });
+  }
+
+  try {
+    const cleanUsername = username.trim().slice(0, 20);
+
+    // Check if username is already taken
+    const { data: existing } = await supabase
+      .from('users')
+      .select('id')
+      .eq('username', cleanUsername)
+      .maybeSingle();
+
+    if (existing) {
       return res.status(409).json({ error: 'Username already taken. Try another.' });
     }
 
-    const hash = await bcrypt.hash(password, SALT_ROUNDS);
-    const result = await pool.query(
-      `INSERT INTO users (username, password_hash, xp, wins, losses)
-       VALUES ($1, $2, 1000, 0, 0) RETURNING *`,
-      [clean, hash]
-    );
-    const user = result.rows[0];
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+    // Upsert user profile (handles both new profiles and trigger-created empty rows)
+    const { data: newProfile, error } = await supabase
+      .from('users')
+      .upsert({
+        id: payload.userId,
+        username: cleanUsername,
+        avatar_color: avatarColor || '#0ECE8F',
+        xp: 1000,
+        wins: 0,
+        losses: 0,
+        streak: 0,
+      })
+      .select()
+      .single();
 
-    console.log(`✅ Registered: ${user.username}`);
+    if (error || !newProfile) {
+      console.error('Error creating profile:', error);
+      return res.status(500).json({ error: 'Failed to create profile.' });
+    }
+
+    console.log(`✅ Profile created: ${newProfile.username}`);
     return res.status(201).json({
-      token,
-      user: { id: user.id, username: user.username, xp: user.xp, wins: user.wins }
+      user: newProfile,
     });
   } catch (err) {
-    console.error('Register error:', err);
-    return res.status(500).json({ error: 'Server error during registration.' });
+    console.error('Create profile error:', err);
+    return res.status(500).json({ error: 'Server error during profile creation.' });
   }
 });
 
-// ─── Auth: Login ───────────────────────────────────────────────────────────────
-app.post('/auth/login', async (req, res) => {
-  const { username, password } = req.body as { username: string; password: string };
+// ─── Auth: Update Profile (username + avatar) ────────────────────────────────
+app.put('/auth/update-profile', async (req, res) => {
+  const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'No token provided' });
 
-  if (!username?.trim() || !password) {
-    return res.status(400).json({ error: 'Username and password are required.' });
+  const payload = await verifyToken(token);
+  if (!payload) return res.status(401).json({ error: 'Invalid or expired token' });
+
+  const { username, avatarColor } = req.body as { username?: string; avatarColor?: string };
+
+  const updates: Record<string, unknown> = {};
+
+  if (username !== undefined) {
+    const clean = username.trim().slice(0, 20);
+    if (clean.length < 3) return res.status(400).json({ error: 'Username must be at least 3 characters.' });
+    if (!/^[a-zA-Z0-9_]+$/.test(clean)) return res.status(400).json({ error: 'Username can only contain letters, numbers, and underscores.' });
+
+    // Check uniqueness — exclude current user
+    const { data: existing } = await supabase
+      .from('users').select('id').eq('username', clean).neq('id', payload.userId).maybeSingle();
+    if (existing) return res.status(409).json({ error: 'Username is already taken. Try another.' });
+    updates.username = clean;
   }
 
+  if (avatarColor !== undefined) {
+    updates.avatar_color = avatarColor;
+  }
+
+  if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'Nothing to update.' });
+
   try {
-    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username.trim()]);
-    const user = result.rows[0];
-
-    if (!user || !user.password_hash) {
-      return res.status(401).json({ error: 'Invalid username or password.' });
+    const { data: updated, error } = await supabase
+      .from('users').update(updates).eq('id', payload.userId)
+      .select('id, username, xp, rating, wins, losses, streak, avatar_color').maybeSingle();
+    if (error || !updated) {
+      console.error('[DB] update-profile error:', error?.message);
+      return res.status(500).json({ error: 'Failed to update profile.' });
     }
-
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid username or password.' });
-    }
-
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
-    console.log(`✅ Login: ${user.username}`);
-
-    return res.json({
-      token,
-      user: { id: user.id, username: user.username, xp: user.xp, wins: user.wins }
-    });
+    console.log(`✅ Profile updated: ${updated.username}`);
+    return res.json({ user: updated });
   } catch (err) {
-    console.error('Login error:', err);
-    return res.status(500).json({ error: 'Server error during login.' });
+    console.error('Update profile error:', err);
+    return res.status(500).json({ error: 'Server error.' });
   }
 });
 
-// ─── JWT Auth Helper ──────────────────────────────────────────────────────────
-function verifyToken(token: string): { userId: number } | null {
+// ─── Auth: Check username availability ───────────────────────────────────────
+app.get('/auth/check-username', async (req, res) => {
+  const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'No token' });
+  const payload = await verifyToken(token);
+  if (!payload) return res.status(401).json({ error: 'Invalid token' });
+
+  const name = (req.query.username as string)?.trim().toLowerCase();
+  if (!name || name.length < 3) return res.json({ available: false });
+
+  const { data } = await supabase
+    .from('users').select('id').eq('username', name).neq('id', payload.userId).maybeSingle();
+  return res.json({ available: !data });
+});
+
+// ─── JWT Auth Helper ────────────────────────────────────────────────────────────
+const _tokenCache = new Map<string, { userId: string; email?: string; expiresAt: number }>();
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _tokenCache) if (v.expiresAt <= now) _tokenCache.delete(k);
+}, 10 * 60 * 1000).unref();
+
+async function verifyToken(token: string): Promise<{ userId: string; email?: string } | null> {
+  const now = Date.now();
+  const cached = _tokenCache.get(token);
+  if (cached && cached.expiresAt > now) return { userId: cached.userId, email: cached.email };
   try {
-    return jwt.verify(token, JWT_SECRET) as { userId: number };
-  } catch {
+    const { data, error } = await authClient.auth.getUser(token);
+    if (error || !data.user) return null;
+    const result = { userId: data.user.id, email: data.user.email };
+    _tokenCache.set(token, { ...result, expiresAt: now + 5 * 60 * 1000 });
+    return result;
+  } catch (err: any) {
+    console.warn('[verifyToken] Supabase unreachable:', err?.cause?.code ?? err?.message);
     return null;
   }
 }
@@ -115,17 +312,43 @@ app.get('/auth/me', async (req, res) => {
   const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'No token provided' });
 
-  const payload = verifyToken(token);
+  const payload = await verifyToken(token);
   if (!payload) return res.status(401).json({ error: 'Invalid or expired token' });
 
   try {
-    const result = await pool.query(
-      'SELECT id, username, xp, wins, losses FROM users WHERE id = $1',
-      [payload.userId]
-    );
-    if (!result.rows[0]) return res.status(404).json({ error: 'User not found' });
-    return res.json({ user: result.rows[0] });
+    const { data: user, error: userErr } = await supabase
+      .from('users')
+      .select('id, username, xp, rating, wins, losses, streak, avatar_color')
+      .eq('id', payload.userId)
+      .maybeSingle();
+
+    if (!user) return res.status(404).json({ error: 'User profile not configured' });
+
+    // Compute global rank (based on XP)
+    const { count } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .gt('xp', user.xp);
+    const rank = (count ?? 0) + 1;
+
+    // Retrieve last match XP change (trend)
+    const { data: trend } = await supabase
+      .from('matches')
+      .select('xp_change')
+      .eq('user_id', payload.userId)
+      .order('played_at', { ascending: false })
+      .limit(1);
+    const lastXpChange = trend && trend[0] ? (trend[0] as any).xp_change : 0;
+
+    return res.json({
+      user: {
+        ...user,
+        rank,
+        lastXpChange
+      }
+    });
   } catch (err) {
+    console.error('Error in /auth/me:', err);
     return res.status(500).json({ error: 'Server error' });
   }
 });
@@ -136,85 +359,93 @@ app.get('/matches', async (req, res) => {
   const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'No token provided' });
 
-  const payload = verifyToken(token);
+  const payload = await verifyToken(token);
   if (!payload) return res.status(401).json({ error: 'Invalid or expired token' });
 
   try {
-    const result = await pool.query(
-      `SELECT id, opponent_name, my_score, opp_score, won, xp_change, played_at
-       FROM matches WHERE user_id = $1
-       ORDER BY played_at DESC LIMIT 50`,
-      [payload.userId]
-    );
-    return res.json({ matches: result.rows });
+    const { data: matches, error } = await supabase
+      .from('matches')
+      .select('id, opponent_name, my_score, opp_score, won, xp_change, played_at')
+      .eq('user_id', payload.userId)
+      .order('played_at', { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+    return res.json({ matches: matches || [] });
   } catch (err) {
+    console.error('Error fetching matches:', err);
     return res.status(500).json({ error: 'Server error' });
   }
 });
 
-// ─── GET /leaderboard — top users ranked by XP ────────────────────────────────
+// ─── GET /leaderboard — top users ranked by rating ────────────────────────────
 app.get('/leaderboard', async (_req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, username, xp, wins, losses
-       FROM users
-       ORDER BY xp DESC
-       LIMIT 20`
-    );
-    return res.json({ leaderboard: result.rows });
+    const { data: leaderboard, error } = await supabase
+      .from('users')
+      .select('username, xp, rating, wins, losses, streak, avatar_color')
+      .order('rating', { ascending: false })
+      .limit(20);
+
+    if (error) throw error;
+    return res.json({ leaderboard: leaderboard || [] });
   } catch (err) {
+    console.error('Error fetching leaderboard:', err);
     return res.status(500).json({ error: 'Server error' });
   }
 });
 
 // ─── Persist match result to DB ───────────────────────────────────────────────
 async function persistMatchResult(
-  userId: number,
-  xpChange: number,
+  userId: string,
+  xpGained: number,
+  ratingChange: number,
   won: boolean,
   opponentName: string,
   myScore: number,
   oppScore: number
 ) {
+  const { error: insertErr } = await supabase.from('matches').insert({
+    user_id: userId,
+    opponent_name: opponentName,
+    my_score: myScore,
+    opp_score: oppScore,
+    won,
+    xp_change: xpGained,
+  });
+  if (insertErr) console.error(`[DB] Failed to insert match for ${userId}:`, insertErr.message);
+  else console.log(`[DB] Match recorded for ${userId} vs ${opponentName}`);
+
   try {
-    // Update user stats
-    if (won) {
-      await pool.query(
-        `UPDATE users SET xp = GREATEST(100, xp + $1), wins = wins + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-        [xpChange, userId]
-      );
-    } else {
-      await pool.query(
-        `UPDATE users SET xp = GREATEST(100, xp + $1), losses = losses + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-        [xpChange, userId]
-      );
-    }
-    // Save match history row
-    await pool.query(
-      `INSERT INTO matches (user_id, opponent_name, my_score, opp_score, won, xp_change)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [userId, opponentName, myScore, oppScore, won, xpChange]
-    );
+    const { error: rpcErr } = await supabase.rpc('update_user_stats', {
+      p_user_id: userId,
+      p_xp_change: xpGained,
+      p_won: won,
+      p_rating_change: ratingChange,
+    });
+    if (rpcErr) console.error(`[DB] Failed to update stats for ${userId}:`, rpcErr.message);
   } catch (err) {
-    console.error(`Failed to persist match for userId ${userId}:`, err);
+    console.error(`[DB] Stats update exception for ${userId}:`, err);
   }
 }
 
-// ─── Socket.io JWT Auth Middleware ────────────────────────────────────────────
-io.use((socket, next) => {
+// ─── Socket.io JWT Auth Middleware (Supabase JWT verification) ──────────────────
+io.use(async (socket, next) => {
   const token = socket.handshake.auth?.token as string | undefined;
 
   if (!token) {
-    // Allow unauthenticated connections for now (for dev/testing without auth)
     console.warn(`[socket] No token for ${socket.id} — allowing as guest`);
     return next();
   }
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as { userId: number; googleId: string };
-    socket.data.userId = payload.userId;
-    socket.data.googleId = payload.googleId;
-    next();
+    const payload = await verifyToken(token);
+    if (payload) {
+      socket.data.userId = payload.userId;
+      next();
+    } else {
+      next(new Error('Authentication failed'));
+    }
   } catch (err) {
     console.warn(`[socket] Invalid token for ${socket.id}`);
     next(new Error('Authentication failed'));
@@ -222,28 +453,91 @@ io.use((socket, next) => {
 });
 
 // ─── Game State Types ──────────────────────────────────────────────────────────
+
+export interface XPBreakdown {
+  base: number;
+  perAnswer: number;
+  accuracy: number;
+  speed: number;
+  streak: number;
+  difficulty: number;
+  sportsmanship: number;
+  daily: number;
+  total: number;
+}
+
 interface Player {
-  id: string;       // socket.id
-  userId?: number;  // postgres users.id
+  id: string;
+  userId?: string;
   username: string;
-  score: number;
+  score: number;           // cumulative point total for this match
+  correctAnswers: number;
+  totalAnswers: number;
+  combo: number;           // current streak
+  longestCombo: number;
+  fastAnswers: number;     // answers answered in < 2s
+  difficultyPoints: number;// sum of difficulty weights for correct answers
+  isFirstMatchToday: boolean;
   wantsPlayAgain: boolean;
   readyForVersus: boolean;
-  xp?: number;
-  xpChange?: number;
+  xp?: number;             // current XP (loaded from DB, used for display)
+  xpChange?: number;       // XP earned this match
+  xpBreakdown?: XPBreakdown;
+  rating?: number;         // current competitive rating (loaded from DB)
+  ratingChange?: number;   // rating change this match
+}
+
+const MATCH_DURATION_MS = 60_000;
+const DIFF_WEIGHT: Record<string, number> = { Easy: 0, Medium: 10, Hard: 25, Expert: 50 };
+
+function calcSpeedBonus(elapsedMs: number): number {
+  if (elapsedMs < 1000) return 50;
+  if (elapsedMs < 2000) return 35;
+  if (elapsedMs < 3000) return 20;
+  if (elapsedMs < 5000) return 10;
+  return 0;
+}
+
+function calcComboBonus(combo: number): number {
+  if (combo >= 10) return 200;
+  if (combo >= 8) return 120;
+  if (combo >= 5) return 60;
+  if (combo >= 3) return 30;
+  return 0;
+}
+
+function calcXP(p: Player, won: boolean, isTie: boolean): XPBreakdown {
+  const base = won ? 120 : (isTie ? 80 : 60);
+  const accuracy = p.totalAnswers > 0 ? p.correctAnswers / p.totalAnswers : 0;
+  const accuracyBonus = accuracy >= 1.0 ? 50 : accuracy >= 0.95 ? 35 : accuracy >= 0.90 ? 20 : accuracy >= 0.80 ? 10 : 0;
+  const speedBonus = (p.correctAnswers > 0 && p.fastAnswers / p.correctAnswers >= 0.5) ? 20 : 0;
+  const streakBonus = p.longestCombo >= 10 ? 60 : p.longestCombo >= 8 ? 40 : p.longestCombo >= 5 ? 20 : 0;
+  const sportsmanship = 10;
+  const total = base + accuracyBonus + speedBonus + streakBonus + sportsmanship;
+  return { base, perAnswer: 0, accuracy: accuracyBonus, speed: speedBonus, streak: streakBonus, difficulty: 0, sportsmanship, daily: 0, total };
+}
+
+function calcRatingChange(myRating: number, oppRating: number, won: boolean, isTie: boolean): number {
+  if (isTie) return 0;
+  const stronger = oppRating > myRating;
+  return won ? (stronger ? 35 : 15) : (stronger ? -15 : -35);
 }
 
 interface GameRoom {
   id: string;
   players: Player[];
   currentQuestion: MathQuestion | null;
+  questionSentAt: number;
   status: 'COUNTDOWN' | 'PLAYING' | 'GAME_OVER';
   winnerId: string | null;
+  questionSentAt: number;
+  matchEndTime: number;
+  matchTimer?: NodeJS.Timeout;
   countdownInterval?: NodeJS.Timeout;
 }
 
 // ─── In-Memory Game State ─────────────────────────────────────────────────────
-let waitingQueue: { id: string; username: string; xp: number; userId?: number }[] = [];
+let waitingQueue: { id: string; username: string; xp: number; rating: number; isFirstMatchToday: boolean; userId?: string }[] = [];
 const rooms = new Map<string, GameRoom>();
 const playerToRoom = new Map<string, string>();
 
@@ -251,21 +545,92 @@ function cleanupRoom(roomId: string) {
   const room = rooms.get(roomId);
   if (room) {
     if (room.countdownInterval) clearInterval(room.countdownInterval);
+    if (room.matchTimer) clearTimeout(room.matchTimer);
     room.players.forEach(p => playerToRoom.delete(p.id));
     rooms.delete(roomId);
     console.log(`Room ${roomId} cleaned up.`);
   }
 }
 
+function endMatchByTimer(roomId: string) {
+  const room = rooms.get(roomId);
+  if (!room || room.status === 'GAME_OVER') return;
+  room.status = 'GAME_OVER';
+  room.matchTimer = undefined;
+
+  const p1 = room.players[0]!;
+  const p2 = room.players[1]!;
+  const isTie = p1.score === p2.score;
+  const isP1Winner = p1.score > p2.score;
+  room.winnerId = isTie ? null : (isP1Winner ? p1.id : p2.id);
+
+  // XP (never decreases)
+  const bd1 = calcXP(p1, isP1Winner && !isTie, isTie);
+  const bd2 = calcXP(p2, !isP1Winner && !isTie, isTie);
+  p1.xpChange = bd1.total;
+  p2.xpChange = bd2.total;
+  p1.xpBreakdown = bd1;
+  p2.xpBreakdown = bd2;
+
+  // Rating (competitive, can go down)
+  const r1 = p1.rating ?? 1000;
+  const r2 = p2.rating ?? 1000;
+  p1.ratingChange = calcRatingChange(r1, r2, isP1Winner && !isTie, isTie);
+  p2.ratingChange = calcRatingChange(r2, r1, !isP1Winner && !isTie, isTie);
+  p1.rating = Math.max(0, r1 + p1.ratingChange);
+  p2.rating = Math.max(0, r2 + p2.ratingChange);
+
+  if (p1.userId) persistMatchResult(p1.userId, bd1.total, p1.ratingChange, isP1Winner && !isTie, p2.username, p1.score, p2.score);
+  if (p2.userId) persistMatchResult(p2.userId, bd2.total, p2.ratingChange, !isP1Winner && !isTie, p1.username, p2.score, p1.score);
+
+  const winnerName = isTie ? 'TIE' : (isP1Winner ? p1.username : p2.username);
+  console.log(`Room ${roomId}: Match ended. ${p1.username}:${p1.score} vs ${p2.username}:${p2.score}. Winner: ${winnerName}. XP: +${bd1.total}/+${bd2.total}`);
+  io.to(roomId).emit('game_over', { winnerId: room.winnerId, players: room.players, tie: isTie });
+}
+
 // ─── Socket Event Handlers ────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id} (userId: ${socket.data.userId ?? 'guest'})`);
 
-  socket.on('join_queue', ({ username, xp }: { username: string; xp?: number }) => {
-    const cleanUsername = username?.trim() || `Player_${socket.id.slice(0, 4)}`;
-    const initialXP = xp || 1000;
+  socket.on('join_queue', async ({ username, xp }: { username: string; xp?: number }) => {
+    if (!socket.data.userId) {
+      socket.emit('auth_required', { message: 'Sign in required to play ranked matches.' });
+      console.warn(`[queue] Rejected guest socket ${socket.id} — no userId`);
+      return;
+    }
 
-    waitingQueue = waitingQueue.filter(p => p.id !== socket.id);
+    const cleanUsername = username?.trim() || `Player_${socket.id.slice(0, 4)}`;
+    let initialXP = xp || 1000;
+    let initialRating = 1000;
+    let isFirstMatchToday = false;
+
+    if (socket.data.userId) {
+      try {
+        const { data: userStats } = await supabase
+          .from('users')
+          .select('xp, rating, last_played_date')
+          .eq('id', socket.data.userId)
+          .maybeSingle();
+        if (userStats) {
+          initialXP = userStats.xp ?? 1000;
+          initialRating = userStats.rating ?? 500;
+          const today = new Date().toISOString().slice(0, 10);
+          isFirstMatchToday = userStats.last_played_date !== today;
+        }
+      } catch (err) {
+        console.error('Error fetching user stats for matchmaking queue:', err);
+      }
+    }
+
+    // Kick any existing socket for this userId from queue and active rooms
+    // Prevents same account playing from two devices simultaneously
+    const duplicateInQueue = waitingQueue.find(p => p.userId === socket.data.userId && p.id !== socket.id);
+    if (duplicateInQueue) {
+      waitingQueue = waitingQueue.filter(p => p.userId !== socket.data.userId);
+      const dupSocket = io.sockets.sockets.get(duplicateInQueue.id);
+      dupSocket?.emit('auth_required', { message: 'You joined from another device. This session ended.' });
+      console.warn(`[queue] Evicted duplicate userId ${socket.data.userId} from queue (old socket: ${duplicateInQueue.id})`);
+    }
     const existingRoomId = playerToRoom.get(socket.id);
     if (existingRoomId) cleanupRoom(existingRoomId);
 
@@ -273,6 +638,8 @@ io.on('connection', (socket) => {
       id: socket.id,
       username: cleanUsername,
       xp: initialXP,
+      rating: initialRating,
+      isFirstMatchToday,
       userId: socket.data.userId,
     });
 
@@ -281,18 +648,34 @@ io.on('connection', (socket) => {
 
     if (waitingQueue.length >= 2) {
       const p1 = waitingQueue.shift()!;
-      const p2 = waitingQueue.shift()!;
+      // Ensure p2 is not the same account as p1 (two-device edge case)
+      const p2Idx = waitingQueue.findIndex(p => p.userId !== p1.userId);
+      if (p2Idx === -1) {
+        waitingQueue.unshift(p1); // put p1 back, no valid opponent yet
+        return;
+      }
+      const p2 = waitingQueue.splice(p2Idx, 1)[0]!;
       const roomId = `room_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+
+      function makePlayer(p: typeof p1): Player {
+        return {
+          id: p.id, userId: p.userId, username: p.username,
+          score: 0, correctAnswers: 0, totalAnswers: 0,
+          combo: 0, longestCombo: 0, fastAnswers: 0,
+          difficultyPoints: 0, isFirstMatchToday: p.isFirstMatchToday,
+          wantsPlayAgain: false, readyForVersus: false,
+          xp: p.xp, rating: p.rating,
+        };
+      }
 
       const newRoom: GameRoom = {
         id: roomId,
-        players: [
-          { id: p1.id, userId: p1.userId, username: p1.username, xp: p1.xp, score: 0, wantsPlayAgain: false, readyForVersus: false },
-          { id: p2.id, userId: p2.userId, username: p2.username, xp: p2.xp, score: 0, wantsPlayAgain: false, readyForVersus: false },
-        ],
+        players: [makePlayer(p1), makePlayer(p2)],
         currentQuestion: null,
+        questionSentAt: 0,
         status: 'COUNTDOWN',
         winnerId: null,
+        matchEndTime: 0,
       };
 
       rooms.set(roomId, newRoom);
@@ -310,6 +693,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('versus_ready', () => {
+    if (!socket.data.userId) return;
     const roomId = playerToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -338,11 +722,16 @@ io.on('connection', (socket) => {
           }
           room.status = 'PLAYING';
           room.currentQuestion = generateQuestion();
+          room.questionSentAt = Date.now();
+          room.matchEndTime = Date.now() + MATCH_DURATION_MS;
+          room.matchTimer = setTimeout(() => endMatchByTimer(roomId), MATCH_DURATION_MS);
           io.to(roomId).emit('game_state_update', {
             status: 'PLAYING',
             players: room.players,
             questionText: room.currentQuestion.text,
+            questionDifficulty: room.currentQuestion.difficulty,
             lastScorer: null,
+            matchEndTime: room.matchEndTime,
           });
         }
       }, 1000);
@@ -350,66 +739,61 @@ io.on('connection', (socket) => {
   });
 
   socket.on('submit_answer', ({ answer }: { answer: number }) => {
+    if (!socket.data.userId) return;
     const roomId = playerToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
     if (!room || room.status !== 'PLAYING' || !room.currentQuestion) return;
 
+    const scoringPlayer = room.players.find(p => p.id === socket.id);
+    if (!scoringPlayer) return;
+
+    scoringPlayer.totalAnswers++;
+
     if (answer === room.currentQuestion.answer) {
-      const scoringPlayer = room.players.find(p => p.id === socket.id);
-      if (!scoringPlayer) return;
+      const elapsed = Date.now() - room.questionSentAt;
+      const speedBonus = calcSpeedBonus(elapsed);
+      if (elapsed < 2000) scoringPlayer.fastAnswers++;
 
-      scoringPlayer.score += 1;
-      console.log(`Room ${roomId}: "${scoringPlayer.username}" scored. Total: ${scoringPlayer.score}`);
+      scoringPlayer.combo++;
+      if (scoringPlayer.combo > scoringPlayer.longestCombo) scoringPlayer.longestCombo = scoringPlayer.combo;
+      const comboBonus = calcComboBonus(scoringPlayer.combo);
 
-      if (scoringPlayer.score >= 10) {
-        room.status = 'GAME_OVER';
-        room.winnerId = scoringPlayer.id;
+      const diffWeight = DIFF_WEIGHT[room.currentQuestion.difficulty] ?? 0;
+      scoringPlayer.difficultyPoints += diffWeight;
 
-        // Elo Rating Calculation
-        const p1 = room.players[0]!;
-        const p2 = room.players[1]!;
-        const isP1Winner = room.winnerId === p1.id;
-        const r1 = p1.xp || 1000;
-        const r2 = p2.xp || 1000;
+      const questionScore = 100 + speedBonus + comboBonus;
+      scoringPlayer.score += questionScore;
+      scoringPlayer.correctAnswers++;
 
-        const exp1 = 1 / (1 + Math.pow(10, (r2 - r1) / 400));
-        const exp2 = 1 / (1 + Math.pow(10, (r1 - r2) / 400));
-        const K = 32;
+      socket.emit('answer_feedback', {
+        correct: true,
+        points: questionScore,
+        speedBonus,
+        comboBonus,
+        combo: scoringPlayer.combo,
+        difficulty: room.currentQuestion.difficulty,
+      });
 
-        p1.xpChange = Math.round(K * ((isP1Winner ? 1 : 0) - exp1));
-        p2.xpChange = Math.round(K * ((isP1Winner ? 0 : 1) - exp2));
-        p1.xp = Math.max(100, r1 + p1.xpChange);
-        p2.xp = Math.max(100, r2 + p2.xpChange);
+      console.log(`Room ${roomId}: "${scoringPlayer.username}" +${questionScore}pts (speed+${speedBonus} combo+${comboBonus}). Score: ${room.players.map(p => `${p.username}:${p.score}`).join(' vs ')}`);
 
-        // Persist to PostgreSQL (with opponent info for match history)
-        if (p1.userId) persistMatchResult(
-          p1.userId, p1.xpChange, isP1Winner,
-          p2.username, p1.score, p2.score
-        );
-        if (p2.userId) persistMatchResult(
-          p2.userId, p2.xpChange!, !isP1Winner,
-          p1.username, p2.score, p1.score
-        );
-
-        console.log(`Room ${roomId}: Game over. Winner: "${scoringPlayer.username}"`);
-        io.to(roomId).emit('game_over', { winnerId: room.winnerId, players: room.players });
-
-      } else {
-        room.currentQuestion = generateQuestion();
-        io.to(roomId).emit('game_state_update', {
-          status: 'PLAYING',
-          players: room.players,
-          questionText: room.currentQuestion.text,
-          lastScorer: scoringPlayer.username,
-        });
-      }
+      room.currentQuestion = generateQuestion();
+      room.questionSentAt = Date.now();
+      io.to(roomId).emit('game_state_update', {
+        status: 'PLAYING',
+        players: room.players,
+        questionText: room.currentQuestion.text,
+        questionDifficulty: room.currentQuestion.difficulty,
+        lastScorer: scoringPlayer.username,
+      });
     } else {
+      scoringPlayer.combo = 0; // reset streak on wrong
       socket.emit('answer_feedback', { correct: false });
     }
   });
 
   socket.on('play_again', () => {
+    if (!socket.data.userId) return;
     const roomId = playerToRoom.get(socket.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
@@ -422,13 +806,19 @@ io.on('connection', (socket) => {
     const allReady = room.players.every(p => p.wantsPlayAgain);
     if (allReady) {
       room.players.forEach(p => {
-        p.score = 0;
-        p.wantsPlayAgain = false;
-        p.readyForVersus = false;
+        p.score = 0; p.correctAnswers = 0; p.totalAnswers = 0;
+        p.combo = 0; p.longestCombo = 0; p.fastAnswers = 0;
+        p.difficultyPoints = 0; p.isFirstMatchToday = false; // daily bonus only once per day
+        p.wantsPlayAgain = false; p.readyForVersus = false;
+        p.xpChange = undefined; p.xpBreakdown = undefined;
+        p.ratingChange = undefined;
       });
       room.status = 'COUNTDOWN';
       room.winnerId = null;
       room.currentQuestion = null;
+      room.questionSentAt = 0;
+      room.matchEndTime = 0;
+      if (room.matchTimer) { clearTimeout(room.matchTimer); room.matchTimer = undefined; }
       if (room.countdownInterval) {
         clearInterval(room.countdownInterval);
         room.countdownInterval = undefined;
@@ -450,7 +840,13 @@ io.on('connection', (socket) => {
     if (roomId) {
       const room = rooms.get(roomId);
       if (room) {
-        io.to(roomId).emit('opponent_left');
+        // If game was active, treat as abort — no stats changed, notify remaining player
+        if (room.status === 'PLAYING' || room.status === 'COUNTDOWN') {
+          socket.to(roomId).emit('opponent_left');
+          console.log(`Room ${roomId}: Player ${socket.id} disconnected mid-game — aborting, no stats recorded.`);
+        } else {
+          io.to(roomId).emit('opponent_left');
+        }
         cleanupRoom(roomId);
       }
     }
@@ -460,13 +856,6 @@ io.on('connection', (socket) => {
 // ─── Startup ───────────────────────────────────────────────────────────────────
 const PORT = Number(process.env.PORT) || 3000;
 
-initDB()
-  .then(() => {
-    server.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 Server running on port ${PORT}`);
-    });
-  })
-  .catch((err) => {
-    console.error('❌ Failed to initialize DB — server not started:', err);
-    process.exit(1);
-  });
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});

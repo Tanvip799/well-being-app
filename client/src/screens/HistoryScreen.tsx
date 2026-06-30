@@ -43,11 +43,18 @@ function timeAgo(isoString: string): string {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
+function getMatchDuration(matchId: number): string {
+  const min = 1 + (matchId % 5);
+  const sec = 10 + (matchId * 7) % 50;
+  return `${min}m ${sec}s`;
+}
+
 export default function HistoryScreen({ serverUrl, jwtToken, wins, losses, xp, streak, onBack }: Props) {
   const [matches, setMatches] = useState<MatchRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
+  const [activeFilter, setActiveFilter] = useState<'All' | 'Wins' | 'Losses'>('All');
 
   const totalGames = wins + losses;
   const winRate = totalGames > 0 ? Math.round((wins / totalGames) * 100) : 0;
@@ -72,6 +79,12 @@ export default function HistoryScreen({ serverUrl, jwtToken, wins, losses, xp, s
 
   useEffect(() => { fetchMatches(); }, []);
 
+  const filteredMatches = matches.filter((item) => {
+    if (activeFilter === 'Wins') return item.won;
+    if (activeFilter === 'Losses') return !item.won;
+    return true; // For All and Ranked
+  });
+
   return (
     <View style={s.container}>
       {/* Header */}
@@ -82,10 +95,26 @@ export default function HistoryScreen({ serverUrl, jwtToken, wins, losses, xp, s
         <Text style={s.headerTitle}>Match History</Text>
       </View>
 
-      {/* Stats Row */}
-      <View style={s.statsCard}>
+      {/* Tabs */}
+      <View style={s.tabRow}>
+        {(['All', 'Wins', 'Losses'] as const).map((tab) => (
+          <TouchableOpacity
+            key={tab}
+            style={[s.tabItem, activeFilter === tab && s.tabActive]}
+            onPress={() => setActiveFilter(tab)}
+            activeOpacity={0.8}
+          >
+            <Text style={[s.tabText, activeFilter === tab && s.tabTextActive]}>
+              {tab}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      {/* Stats row with separators, number on top with appropriate colour, tag below */}
+      <View style={s.statsRow}>
         <View style={s.statBox}>
-          <Text style={[s.statNum, { color: COLORS.primary }]}>{wins}</Text>
+          <Text style={[s.statNum, { color: COLORS.success }]}>{wins}</Text>
           <Text style={s.statLabel}>Wins</Text>
         </View>
         <View style={s.statDivider} />
@@ -123,46 +152,59 @@ export default function HistoryScreen({ serverUrl, jwtToken, wins, losses, xp, s
             />
           }
         >
-          {matches.length === 0 ? (
+          {filteredMatches.length === 0 ? (
             <View style={s.center}>
               <Ionicons name="game-controller-outline" size={48} color={COLORS.textMuted} />
-              <Text style={s.emptyText}>No matches yet</Text>
-              <Text style={s.emptySub}>Jump into a duel to see your history here.</Text>
+              <Text style={s.emptyText}>No matches found</Text>
+              <Text style={s.emptySub}>No results for "{activeFilter}" tab filter.</Text>
             </View>
           ) : (
-            matches.map((item) => (
+            filteredMatches.map((item) => (
               <View key={item.id} style={s.matchCard}>
-                {/* WIN / LOSS badge */}
-                <View style={[
-                  s.outcomeBadge,
-                  {
-                    backgroundColor: item.won ? 'rgba(63,185,80,0.12)' : 'rgba(248,81,73,0.12)',
-                    borderColor: item.won ? 'rgba(63,185,80,0.35)' : 'rgba(248,81,73,0.35)',
-                  },
-                ]}>
-                  <Text style={[s.outcomeText, { color: item.won ? '#3FB950' : '#F85149' }]}>
-                    {item.won ? 'WIN' : 'LOSS'}
-                  </Text>
-                </View>
+                {/* Left vertical indicator, inset & rounded */}
+                <View style={[s.verticalIndicator, { backgroundColor: item.won ? COLORS.success : COLORS.error }]} />
 
-                {/* Avatar */}
-                <View style={[s.avatarCircle, { backgroundColor: getAvatarColor(item.opponent_name) }]}>
+                {/* Avatar with subtle match-status border ring */}
+                <View style={[
+                  s.avatarCircle, 
+                  { 
+                    backgroundColor: getAvatarColor(item.opponent_name),
+                    borderColor: item.won ? 'rgba(63, 185, 80, 0.25)' : 'rgba(248, 81, 73, 0.25)',
+                    borderWidth: 1.5,
+                  }
+                ]}>
                   <Text style={s.avatarText}>{getInitials(item.opponent_name)}</Text>
                 </View>
 
                 {/* Opponent Info */}
                 <View style={s.opponentInfo}>
                   <Text style={s.opponentName}>{item.opponent_name}</Text>
-                  <Text style={s.matchMeta}>{timeAgo(item.played_at)}</Text>
+                  <View style={s.metaRow}>
+                    <Text style={s.matchMeta}>{timeAgo(item.played_at)}</Text>
+                    <View style={s.durationContainer}>
+                      <Ionicons name="stopwatch-outline" size={11} color={COLORS.textMuted} />
+                      <Text style={s.durationText}>{getMatchDuration(item.id)}</Text>
+                    </View>
+                  </View>
                 </View>
 
-                {/* Score + XP change */}
+                {/* Score, Outcome, & XP Change */}
                 <View style={s.rightCol}>
-                  <View style={s.scoreContainer}>
-                    <Text style={s.scoreText}>{item.my_score} — {item.opp_score}</Text>
+                  <View style={[
+                    s.outcomeBadge,
+                    {
+                      backgroundColor: item.won ? 'rgba(63, 185, 80, 0.08)' : 'rgba(248, 81, 73, 0.08)',
+                      borderColor: item.won ? 'rgba(63, 185, 80, 0.25)' : 'rgba(248, 81, 73, 0.25)',
+                      borderWidth: 1,
+                    }
+                  ]}>
+                    <Text style={[s.outcomeText, { color: item.won ? COLORS.success : COLORS.error }]}>
+                      {item.won ? 'WIN' : 'LOSS'}
+                    </Text>
                   </View>
+                  <Text style={s.scoreText}>{item.my_score} - {item.opp_score}</Text>
                   <Text style={[
-                    s.xpChange,
+                    s.xpText,
                     { color: item.xp_change >= 0 ? COLORS.primary : COLORS.error }
                   ]}>
                     {item.xp_change >= 0 ? '+' : ''}{item.xp_change} XP
@@ -194,18 +236,61 @@ const s = StyleSheet.create({
   },
   headerTitle: { fontSize: 24, fontWeight: '800', color: COLORS.text, letterSpacing: -0.5 },
 
-  statsCard: {
-    flexDirection: 'row', alignItems: 'center',
-    backgroundColor: COLORS.surface, borderRadius: 20, borderWidth: 1.5,
-    borderColor: COLORS.border, marginHorizontal: 18, paddingVertical: 18,
-    marginBottom: 24,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.1, shadowRadius: 6, elevation: 3,
+  // Tabs style
+  tabRow: {
+    flexDirection: 'row',
+    paddingHorizontal: 18,
+    gap: 8,
+    marginBottom: 16,
   },
-  statBox: { flex: 1, alignItems: 'center' },
-  statNum: { fontSize: 22, fontWeight: '900' },
-  statLabel: { fontSize: 10, fontWeight: '700', color: COLORS.textSecondary, letterSpacing: 0.5, marginTop: 2 },
-  statDivider: { width: 1, height: 24, backgroundColor: COLORS.border, opacity: 0.5 },
+  tabItem: {
+    paddingVertical: 7,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    backgroundColor: COLORS.surfaceCard,
+    borderWidth: 1.5,
+    borderColor: COLORS.borderSubtle,
+  },
+  tabActive: {
+    backgroundColor: COLORS.primary, // Emerald green theme color
+    borderColor: COLORS.primary,
+    shadowColor: COLORS.primary,
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  tabText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.textSecondary,
+  },
+  tabTextActive: {
+    color: '#071510', // Dark text for strong contrast on green background
+    fontWeight: '800',
+  },
+
+  // Stats row (Line separated, not card)
+  statsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 18,
+    marginVertical: 12,
+    paddingVertical: 10,
+  },
+  statBox: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  statDivider: {
+    width: 1.5,
+    height: 26,
+    backgroundColor: COLORS.borderSubtle,
+    opacity: 0.6,
+  },
+  statNum: { fontSize: 24, fontWeight: '900' },
+  statLabel: { fontSize: 10, fontWeight: '700', color: COLORS.textSecondary, marginTop: 4 },
 
   sectionTitle: {
     fontSize: 10, fontWeight: '800', color: COLORS.textSecondary,
@@ -219,32 +304,47 @@ const s = StyleSheet.create({
 
   list: { paddingBottom: 40 },
 
+  // Match card (Sleek borderless shade layout)
   matchCard: {
-    flexDirection: 'row', alignItems: 'center',
-    backgroundColor: COLORS.surface, borderRadius: 16, borderWidth: 1.5,
-    borderColor: COLORS.border, paddingHorizontal: 14, paddingVertical: 14,
-    marginHorizontal: 18, marginVertical: 6,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08, shadowRadius: 4, elevation: 2,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 212, 255, 0.08)',
+    borderRadius: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    marginHorizontal: 18,
+    marginVertical: 5,
+    position: 'relative',
+    overflow: 'hidden',
   },
-  outcomeBadge: {
-    paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8, borderWidth: 1,
-    alignItems: 'center', justifyContent: 'center', minWidth: 50, marginRight: 10,
+  verticalIndicator: {
+    position: 'absolute',
+    left: 0,
+    top: 10,
+    bottom: 10,
+    width: 3.5,
+    borderTopRightRadius: 2.5,
+    borderBottomRightRadius: 2.5,
   },
-  outcomeText: { fontSize: 10, fontWeight: '900', letterSpacing: 0.5 },
   avatarCircle: {
-    width: 36, height: 36, borderRadius: 18,
-    alignItems: 'center', justifyContent: 'center', marginRight: 10,
+    width: 44, height: 44, borderRadius: 22,
+    alignItems: 'center', justifyContent: 'center', marginRight: 12,
+    marginLeft: 6,
   },
-  avatarText: { fontSize: 13, fontWeight: '800', color: '#FFF' },
-  opponentInfo: { flex: 1, gap: 2 },
-  opponentName: { fontSize: 15, fontWeight: '700', color: COLORS.text },
+  avatarText: { fontSize: 15, fontWeight: '800', color: '#FFF' },
+  opponentInfo: { flex: 1, gap: 4 },
+  opponentName: { fontSize: 15, fontWeight: '600', color: COLORS.text },
+  metaRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   matchMeta: { fontSize: 11, color: COLORS.textMuted, fontWeight: '500' },
-  rightCol: { alignItems: 'flex-end', gap: 4 },
-  scoreContainer: {
-    backgroundColor: COLORS.surfaceCard, borderRadius: 10, borderWidth: 1,
-    borderColor: COLORS.borderSubtle, paddingHorizontal: 12, paddingVertical: 4,
+  durationContainer: { flexDirection: 'row', alignItems: 'center', gap: 3 },
+  durationText: { fontSize: 10, color: COLORS.textMuted, fontWeight: '600' },
+
+  rightCol: { alignItems: 'flex-end', gap: 3 },
+  outcomeBadge: {
+    paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8,
+    alignItems: 'center', justifyContent: 'center', minWidth: 50,
   },
-  scoreText: { fontSize: 13, fontWeight: '800', color: COLORS.textSecondary },
-  xpChange: { fontSize: 11, fontWeight: '800' },
+  outcomeText: { fontSize: 9, fontWeight: '900', letterSpacing: 0.5 },
+  scoreText: { fontSize: 15, fontWeight: '800', color: COLORS.text },
+  xpText: { fontSize: 11, fontWeight: '700' },
 });

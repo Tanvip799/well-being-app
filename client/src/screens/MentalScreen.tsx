@@ -30,36 +30,57 @@ function AvatarSquare({ name, isMe, color, size = 72 }: { name: string; isMe?: b
   );
 }
 
+// ── XP Breakdown Row ─────────────────────────────────────────────────────────
+function XPRow({ label, val, color }: { label: string; val: number; color?: string }) {
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 5 }}>
+      <Text style={{ fontSize: 13, color: COLORS.textSecondary, fontWeight: '500' }}>{label}</Text>
+      <Text style={{ fontSize: 13, color: color ?? COLORS.primary, fontWeight: '700' }}>+{val}</Text>
+    </View>
+  );
+}
+
 // ── Props ────────────────────────────────────────────────────────────────────
 interface MentalScreenProps {
   username: string;
+  avatarColor?: string;
   serverUrl: string;
   jwtToken?: string | null;
+  getFreshToken?: () => Promise<string | null>;
   soundEnabled: boolean;
   vibrationEnabled: boolean;
   onScreenStateChange: (s: string) => void;
   onGameFinished: (r: { won: boolean; opponentName: string; myScore: number; oppScore: number; ratingChange: number }) => void;
   navigateTo: (tab: 'home' | 'leaderboard' | 'history' | 'profile') => void;
   wins: number;
+  losses: number;
   xp: number;
   streak: number;
+  rank: number;
+  lastXpChange: number;
 }
 
-interface SocketPlayer { id: string; username: string; score: number; wantsPlayAgain: boolean; xp?: number; xpChange?: number; }
+interface XPBreakdown { base: number; perAnswer: number; accuracy: number; speed: number; streak: number; difficulty: number; sportsmanship: number; daily: number; total: number; }
+interface SocketPlayer { id: string; username: string; score: number; correctAnswers?: number; wantsPlayAgain: boolean; xp?: number; xpChange?: number; xpBreakdown?: XPBreakdown; rating?: number; ratingChange?: number; }
 type ScreenState = 'LOBBY' | 'CONNECTING' | 'SEARCHING' | 'VERSUS' | 'PLAYING' | 'GAME_OVER';
 
 export default function MentalScreen({
   username,
+  avatarColor,
   serverUrl,
   jwtToken,
+  getFreshToken,
   soundEnabled,
   vibrationEnabled,
   onScreenStateChange,
   onGameFinished,
   navigateTo,
   wins,
+  losses,
   xp,
   streak,
+  rank,
+  lastXpChange,
 }: MentalScreenProps) {
   const [screenState, setScreenState] = useState<ScreenState>('LOBBY');
   const [socket, setSocket]           = useState<Socket | null>(null);
@@ -71,13 +92,24 @@ export default function MentalScreen({
   const [winnerId, setWinnerId]       = useState<string | null>(null);
   const [opponentLeft, setOpponentLeft] = useState(false);
   const [answerInput, setAnswerInput] = useState('');
-  const [wrongFlash, setWrongFlash]   = useState(false);
+  const [wrongFlash, setWrongFlash]     = useState(false);
   const [correctFlash, setCorrectFlash] = useState(false);
-  const [questionTimer, setQuestionTimer] = useState(60);
-  const [questionCount, setQuestionCount] = useState(0);
+  const [matchTimeLeft, setMatchTimeLeft] = useState(60);
+  const [matchEndTime, setMatchEndTime]   = useState(0);
 
-  const searchTimerRef = useRef<any>(null);
-  const qTimerRef      = useRef<any>(null);
+  // Bonus popup state
+  const [bonusEvent, setBonusEvent] = useState<{ points: number; speedBonus: number; comboBonus: number; combo: number } | null>(null);
+  const bonusAnim   = useRef(new Animated.Value(0)).current;
+  const bonusTimer  = useRef<any>(null);
+
+  // XP breakdown for game-over screen
+  const [myXpGained, setMyXpGained]       = useState(0);
+  const [myRatingChange, setMyRatingChange] = useState(0);
+  const [myXpBreakdown, setMyXpBreakdown]   = useState<XPBreakdown | null>(null);
+  const [lastAnswerPoints, setLastAnswerPoints] = useState(0);
+
+  const searchTimerRef  = useRef<any>(null);
+  const matchTimerRef   = useRef<any>(null);
   const pendingUpdate  = useRef<any>(null);
   const firstUpdate    = useRef(true);
 
@@ -147,12 +179,17 @@ export default function MentalScreen({
     }
   }, [screenState]);
 
-  const startQTimer = () => {
-    if (qTimerRef.current) clearInterval(qTimerRef.current);
-    setQuestionTimer(60);
-    qTimerRef.current = setInterval(() => setQuestionTimer(p => { if (p <= 1) { clearInterval(qTimerRef.current); return 0; } return p - 1; }), 1000);
+  const startMatchTimer = (endTime: number) => {
+    if (matchTimerRef.current) clearInterval(matchTimerRef.current);
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
+      setMatchTimeLeft(left);
+      if (left <= 0) clearInterval(matchTimerRef.current);
+    };
+    tick();
+    matchTimerRef.current = setInterval(tick, 250);
   };
-  const stopQTimer = () => { if (qTimerRef.current) { clearInterval(qTimerRef.current); qTimerRef.current = null; } };
+  const stopMatchTimer = () => { if (matchTimerRef.current) { clearInterval(matchTimerRef.current); matchTimerRef.current = null; } };
 
   // Trigger text field shake on wrong answer
   const triggerShake = () => {
@@ -167,13 +204,15 @@ export default function MentalScreen({
     ]).start();
   };
 
-  const startMatchmaking = () => {
+  const startMatchmaking = async () => {
     setScreenState('CONNECTING');
+    // Prefer a fresh token; fall back to the current jwtToken prop if refresh fails
+    const token = (getFreshToken ? await getFreshToken().catch(() => null) : null) ?? jwtToken;
     const sock = io(serverUrl, {
       transports: ['websocket'],
       forceNew: true,
       timeout: 6000,
-      auth: jwtToken ? { token: jwtToken } : {},
+      auth: token ? { token } : {},
     });
 
     sock.on('connect', () => {
@@ -187,11 +226,16 @@ export default function MentalScreen({
       Alert.alert('Connection Failed', `Cannot reach server at:\n${serverUrl}`);
     });
 
+    sock.on('auth_required', (data: { message: string }) => {
+      sock.disconnect(); setSocket(null); setScreenState('LOBBY');
+      Alert.alert('Sign In Required', data.message);
+    });
+
     sock.on('match_found', (data: { roomId: string; players: SocketPlayer[] }) => {
       if (searchTimerRef.current) clearInterval(searchTimerRef.current);
       firstUpdate.current = true;
       setPlayers(data.players); setOpponentLeft(false);
-      setCountdown(3); setScreenState('VERSUS'); setWinnerId(null); setQuestionCount(0);
+      setCountdown(3); setScreenState('VERSUS'); setWinnerId(null); setMatchTimeLeft(60); setMatchEndTime(0);
       // Handshake: tell the server we are successfully on the Match screen and ready for countdown
       sock.emit('versus_ready');
     });
@@ -202,7 +246,7 @@ export default function MentalScreen({
       Animated.spring(cdScale, { toValue: 1, friction: 3.5, tension: 140, useNativeDriver: Platform.OS !== 'web' }).start();
     });
 
-    sock.on('game_state_update', (data: { status: string; players: SocketPlayer[]; questionText: string; lastScorer: string | null }) => {
+    sock.on('game_state_update', (data: { status: string; players: SocketPlayer[]; questionText: string; lastScorer: string | null; matchEndTime?: number }) => {
       if (firstUpdate.current) {
         firstUpdate.current = false;
         pendingUpdate.current = data;
@@ -211,21 +255,35 @@ export default function MentalScreen({
           const p = pendingUpdate.current;
           if (p) {
             setPlayers(p.players); setQuestionText(p.questionText); setLastScorer(p.lastScorer);
-            setAnswerInput(''); setWrongFlash(false); setQuestionCount(1);
-            setScreenState('PLAYING'); startQTimer(); pendingUpdate.current = null;
+            setAnswerInput(''); setWrongFlash(false);
+            if (p.matchEndTime) { setMatchEndTime(p.matchEndTime); startMatchTimer(p.matchEndTime); }
+            setScreenState('PLAYING'); pendingUpdate.current = null;
           }
         }, 750);
       } else {
         setPlayers(data.players); setQuestionText(data.questionText); setLastScorer(data.lastScorer);
-        setAnswerInput(''); setWrongFlash(false); setQuestionCount(n => n + 1); startQTimer();
+        setAnswerInput(''); setWrongFlash(false);
       }
     });
 
-    sock.on('answer_feedback', (data: { correct: boolean }) => {
+    sock.on('answer_feedback', (data: { correct: boolean; points?: number; speedBonus?: number; comboBonus?: number; combo?: number }) => {
       if (data.correct) {
         setCorrectFlash(true);
         if (vibrationEnabled) Vibration.vibrate(40);
         setTimeout(() => setCorrectFlash(false), 400);
+        // Show bonus popup whenever there are extra bonuses
+        const sb = data.speedBonus ?? 0;
+        const cb = data.comboBonus ?? 0;
+        if (sb > 0 || cb > 0) {
+          if (bonusTimer.current) clearTimeout(bonusTimer.current);
+          setBonusEvent({ points: data.points ?? 100, speedBonus: sb, comboBonus: cb, combo: data.combo ?? 0 });
+          bonusAnim.setValue(0);
+          Animated.spring(bonusAnim, { toValue: 1, tension: 100, friction: 8, useNativeDriver: Platform.OS !== 'web' }).start();
+          bonusTimer.current = setTimeout(() => {
+            Animated.timing(bonusAnim, { toValue: 0, duration: 280, useNativeDriver: Platform.OS !== 'web' }).start(() => setBonusEvent(null));
+          }, 1800);
+        }
+        setLastAnswerPoints(data.points ?? 100);
       } else {
         setWrongFlash(true);
         triggerShake();
@@ -234,42 +292,47 @@ export default function MentalScreen({
       }
     });
 
-    sock.on('game_over', (data: { winnerId: string; players: SocketPlayer[] }) => {
-      stopQTimer(); setPlayers(data.players); setWinnerId(data.winnerId); setScreenState('GAME_OVER');
+    sock.on('game_over', (data: { winnerId: string | null; players: SocketPlayer[]; tie?: boolean }) => {
+      stopMatchTimer(); setPlayers(data.players); setWinnerId(data.winnerId); setScreenState('GAME_OVER');
+      const me = data.players.find(p => p.id === sock.id);
       const opp = data.players.find(p => p.id !== sock.id);
       const isWin = data.winnerId === sock.id;
-      const me = data.players.find(p => p.id === sock.id);
-      const change = me?.xpChange ?? (isWin ? 18 : -12);
-      setRatingChange(change);
+      const xpGained = me?.xpChange ?? 0;
+      const rc = me?.ratingChange ?? 0;
+      setRatingChange(rc);
+      setMyXpGained(xpGained);
+      setMyXpBreakdown(me?.xpBreakdown ?? null);
+      setMyRatingChange(rc);
 
-      onGameFinished({ 
-        won: isWin, 
-        opponentName: opp?.username ?? 'Opponent', 
-        myScore: me?.score ?? 0, 
+      onGameFinished({
+        won: isWin,
+        opponentName: opp?.username ?? 'Opponent',
+        myScore: me?.score ?? 0,
         oppScore: opp?.score ?? 0,
-        ratingChange: change
+        ratingChange: rc,
       });
       if (vibrationEnabled) { if (isWin) Vibration.vibrate([0, 100, 80, 200, 80, 300]); else Vibration.vibrate(450); }
     });
 
-    sock.on('opponent_left', () => { stopQTimer(); setOpponentLeft(true); setScreenState('GAME_OVER'); });
+    sock.on('opponent_left', () => { stopMatchTimer(); setOpponentLeft(true); setScreenState('GAME_OVER'); });
 
     sock.on('player_ready_status', (data: { players: { id: string; wantsPlayAgain: boolean }[] }) => {
       setPlayers(prev => prev.map(p => { const m = data.players.find(x => x.id === p.id); return m ? { ...p, wantsPlayAgain: m.wantsPlayAgain } : p; }));
     });
 
     sock.on('match_restarting', () => {
+      stopMatchTimer();
       firstUpdate.current = true; setCountdown(3); setScreenState('VERSUS');
-      setWinnerId(null); setOpponentLeft(false); setQuestionCount(0);
-      sock.emit('versus_ready'); // Handshake for rematch sync countdown
+      setWinnerId(null); setOpponentLeft(false); setMatchTimeLeft(60); setMatchEndTime(0);
+      sock.emit('versus_ready');
     });
   };
 
   const leave = () => {
     if (searchTimerRef.current) clearInterval(searchTimerRef.current);
-    stopQTimer(); socket?.disconnect(); setSocket(null);
+    stopMatchTimer(); socket?.disconnect(); setSocket(null);
     setScreenState('LOBBY'); setPlayers([]); setAnswerInput('');
-    setCountdown(null); setWinnerId(null); setOpponentLeft(false); setQuestionCount(0);
+    setCountdown(null); setWinnerId(null); setOpponentLeft(false); setMatchTimeLeft(60); setMatchEndTime(0);
     firstUpdate.current = true; pendingUpdate.current = null;
   };
 
@@ -293,7 +356,7 @@ export default function MentalScreen({
   // SCREEN: LOBBY / HOME
   // ════════════════════════════════════════════════════════════════════════════
   if (screenState === 'LOBBY') {
-    const winRate = wins > 0 ? Math.min(95, 60 + (wins % 15)) : 0;
+    const winRate = (wins + losses) > 0 ? Math.round((wins / (wins + losses)) * 100) : 0;
     return (
       <View style={s.lobbyRoot}>
         {/* ── Header ── */}
@@ -302,9 +365,15 @@ export default function MentalScreen({
             <Text style={s.welcomeSmall}>Welcome back</Text>
             <Text style={s.welcomeName}>{username}</Text>
           </View>
-          <View style={s.meAvatar}>
-            <Text style={s.meAvatarText}>{getInitials(username)}</Text>
-          </View>
+          <TouchableOpacity
+            style={[s.meAvatar, avatarColor?.includes(':') ? { backgroundColor: avatarColor.split(':')[0] } : { backgroundColor: getAvatarColor(username) }]}
+            onPress={() => navigateTo('profile')}
+            activeOpacity={0.8}
+          >
+            <Text style={s.meAvatarText}>
+              {avatarColor?.includes(':') ? avatarColor.split(':')[1] : getInitials(username)}
+            </Text>
+          </TouchableOpacity>
         </View>
 
         {/* Card 1: Your Rating Dashboard */}
@@ -312,12 +381,23 @@ export default function MentalScreen({
           <Text style={s.ratingLabel}>YOUR RATING</Text>
           <View style={s.ratingValueRow}>
             <Text style={s.ratingValueText}>{xp.toLocaleString()}</Text>
-            <Text style={s.ratingTrendText}>▲ 24</Text>
+            {lastXpChange !== 0 ? (
+              <Text style={[
+                s.ratingTrendText,
+                { color: lastXpChange > 0 ? COLORS.primary : COLORS.error }
+              ]}>
+                {lastXpChange > 0 ? `▲ ${lastXpChange}` : `▼ ${Math.abs(lastXpChange)}`}
+              </Text>
+            ) : (
+              <Text style={[s.ratingTrendText, { color: COLORS.textMuted }]}>
+                --
+              </Text>
+            )}
           </View>
           
           <View style={s.statsCardRow}>
             <View style={s.statsMiniCard}>
-              <Text style={s.statsMiniVal}>#7</Text>
+              <Text style={s.statsMiniVal}>#{rank}</Text>
               <Text style={s.statsMiniSub}>Global rank</Text>
             </View>
             <View style={s.statsMiniCard}>
@@ -547,68 +627,48 @@ export default function MentalScreen({
       }
     };
 
+    // Timer turns red in last 10 seconds
+    const timerUrgent = matchTimeLeft <= 10;
+
     return (
       <View style={s.gameRoot}>
-        {/* Round Outline Pill at top */}
-        <View style={s.roundPillContainer}>
-          <View style={s.roundPill}>
-            <Text style={s.roundPillText}>Round {questionCount} of 7</Text>
-          </View>
-        </View>
-
-        {/* HUD: Score cards + Circular Timer */}
+        {/* HUD: Score cards + Match Timer */}
         <View style={s.gameHUDRow}>
           {/* Player Score Card */}
           <View style={[
-            s.gameScoreCard, 
+            s.gameScoreCard,
             { borderColor: 'rgba(0, 212, 255, 0.25)' },
-            myScore >= oppScore && { 
+            myScore > oppScore && {
               borderColor: '#00D4FF',
-              shadowColor: '#00D4FF',
-              shadowOffset: { width: 0, height: 0 },
-              shadowOpacity: 0.35,
-              shadowRadius: 10,
-              elevation: 4,
+              shadowColor: '#00D4FF', shadowOffset: { width: 0, height: 0 },
+              shadowOpacity: 0.35, shadowRadius: 10, elevation: 4,
             }
           ]}>
             <View style={s.cardHeaderRow}>
               <Text style={[s.gameCardLabel, { color: COLORS.accent }]}>YOU</Text>
               <Animated.View style={[s.scoreFloater, { transform: [{ translateY: floatMyY }], opacity: floatMyOpacity }]}>
-                <Text style={s.scoreFloaterText}>+1</Text>
+                <Text style={s.scoreFloaterText}>+{lastAnswerPoints}</Text>
               </Animated.View>
             </View>
             <Text style={[s.gameCardScoreText, { color: COLORS.accent }]}>{myScore}</Text>
-            
-            {/* Visual Indicators - 5 dots */}
-            <View style={s.dotRow}>
-              {Array.from({ length: 5 }).map((_, idx) => (
-                <View 
-                  key={idx} 
-                  style={[s.dotIndicator, idx < myScore ? { backgroundColor: COLORS.primary } : { backgroundColor: 'rgba(255,255,255,0.06)' }]} 
-                />
-              ))}
-            </View>
           </View>
 
-          {/* Circular Timer */}
+          {/* Circular Match Timer */}
           <View style={s.circularTimerWrapper}>
-            <View style={s.circularTimerRing}>
-              <Text style={s.circularTimerText}>{questionTimer}</Text>
-              <Text style={s.circularTimerSec}>SEC</Text>
+            <View style={[s.circularTimerRing, timerUrgent && { borderColor: COLORS.error }]}>
+              <Text style={[s.circularTimerText, timerUrgent && { color: COLORS.error }]}>{matchTimeLeft}</Text>
+              <Text style={[s.circularTimerSec, timerUrgent && { color: COLORS.error }]}>SEC</Text>
             </View>
           </View>
 
           {/* Opponent Score Card */}
           <View style={[
-            s.gameScoreCard, 
+            s.gameScoreCard,
             { borderColor: 'rgba(139, 92, 246, 0.25)' },
-            oppScore >= myScore && { 
+            oppScore > myScore && {
               borderColor: '#8B5CF6',
-              shadowColor: '#8B5CF6',
-              shadowOffset: { width: 0, height: 0 },
-              shadowOpacity: 0.35,
-              shadowRadius: 10,
-              elevation: 4,
+              shadowColor: '#8B5CF6', shadowOffset: { width: 0, height: 0 },
+              shadowOpacity: 0.35, shadowRadius: 10, elevation: 4,
             }
           ]}>
             <View style={s.cardHeaderRow}>
@@ -618,18 +678,31 @@ export default function MentalScreen({
               <Text style={[s.gameCardLabel, { color: '#8B5CF6' }]}>{oppLabel}</Text>
             </View>
             <Text style={[s.gameCardScoreText, { color: '#8B5CF6' }]}>{oppScore}</Text>
-            
-            {/* Visual Indicators - 5 dots */}
-            <View style={s.dotRow}>
-              {Array.from({ length: 5 }).map((_, idx) => (
-                <View 
-                  key={idx} 
-                  style={[s.dotIndicator, idx < oppScore ? { backgroundColor: '#8B5CF6' } : { backgroundColor: 'rgba(255,255,255,0.06)' }]} 
-                />
-              ))}
-            </View>
           </View>
         </View>
+
+        {/* Bonus popup — slides up when speed/combo earned */}
+        {bonusEvent && (
+          <Animated.View pointerEvents="none" style={[s.bonusPopup, {
+            opacity: bonusAnim,
+            transform: [{ translateY: bonusAnim.interpolate({ inputRange: [0, 1], outputRange: [12, 0] }) },
+                        { scale: bonusAnim.interpolate({ inputRange: [0, 0.5, 1], outputRange: [0.85, 1.05, 1] }) }],
+          }]}>
+            <Text style={s.bonusPtsText}>+{bonusEvent.points} PTS</Text>
+            <View style={s.bonusBadgeRow}>
+              {bonusEvent.speedBonus > 0 && (
+                <View style={[s.bonusBadge, { backgroundColor: 'rgba(0,212,255,0.15)', borderColor: COLORS.accent }]}>
+                  <Text style={[s.bonusBadgeText, { color: COLORS.accent }]}>⚡ +{bonusEvent.speedBonus} FAST</Text>
+                </View>
+              )}
+              {bonusEvent.comboBonus > 0 && (
+                <View style={[s.bonusBadge, { backgroundColor: 'rgba(255,159,10,0.15)', borderColor: COLORS.gold }]}>
+                  <Text style={[s.bonusBadgeText, { color: COLORS.gold }]}>🔥 x{bonusEvent.combo} +{bonusEvent.comboBonus}</Text>
+                </View>
+              )}
+            </View>
+          </Animated.View>
+        )}
 
         {/* Equation Card */}
         <View style={[
@@ -662,9 +735,6 @@ export default function MentalScreen({
             {answerInput.length > 0 && <Text style={{ color: COLORS.primary }}>|</Text>}
           </Text>
         </Animated.View>
-
-        {/* Spacer to push keypad to the bottom */}
-        <View style={{ flex: 1 }} />
 
         {/* Tactile Grid Keypad */}
         <View style={s.newKeypadSection}>
@@ -737,54 +807,47 @@ export default function MentalScreen({
   // SCREEN: GAME OVER / WINNER
   // ════════════════════════════════════════════════════════════════════════════
   if (screenState === 'GAME_OVER') {
-    const isWin      = winnerId === socket?.id;
-    const myScore    = myPlayer?.score ?? 0;
-    const oppScore   = oppPlayer?.score ?? 0;
-    const oppShort   = (oppName.split(' ')[0] ?? 'OPP').toUpperCase();
-    const totalRounds = myScore + oppScore;
-
+    const isWin     = winnerId === socket?.id;
+    const isTie     = !opponentLeft && winnerId === null;
+    const myScore   = myPlayer?.score ?? 0;
+    const oppScore  = oppPlayer?.score ?? 0;
+    const oppShort  = (oppName.split(' ')[0] ?? 'OPP').toUpperCase();
     const showAbort = opponentLeft && winnerId === null;
+
+    const resultColor  = showAbort ? COLORS.textMuted : isTie ? COLORS.gold : isWin ? COLORS.primary : '#F85149';
+    const trophyColor  = resultColor;
+    const trophyIcon   = isTie ? 'ribbon-outline' : (isWin && !showAbort) ? 'trophy' : 'sad-outline';
 
     return (
       <View style={s.gameOverRoot}>
         <View style={s.gameOverGlow} />
 
-        {/* Confetti + Trophy glowing wrapper */}
+        {/* Top-left lobby button */}
+        <TouchableOpacity style={s.goBackBtn} onPress={leave} activeOpacity={0.7}>
+          <Ionicons name="chevron-back" size={18} color={COLORS.textSecondary} />
+          <Text style={s.goBackText}>Lobby</Text>
+        </TouchableOpacity>
+
+        {/* Trophy */}
         <View style={s.trophyWrapper}>
-          <View style={[
-            s.trophyRing,
-            {
-              borderColor: isWin && !showAbort ? COLORS.primary : COLORS.border,
-              shadowColor: isWin && !showAbort ? COLORS.primary : '#000',
-              shadowOpacity: isWin && !showAbort ? 0.85 : 0.25,
-              shadowRadius: 30,
-              elevation: 15,
-            }
-          ]}>
+          <View style={[s.trophyRing, {
+            borderColor: trophyColor,
+            shadowColor: trophyColor,
+            shadowOpacity: (isWin || isTie) ? 0.7 : 0.2,
+            shadowRadius: 24, elevation: 12,
+          }]}>
             <View style={s.trophyInner}>
-              <Ionicons name={isWin && !showAbort ? 'trophy' : 'sad-outline'} size={48} color={isWin && !showAbort ? COLORS.gold : COLORS.textMuted} />
+              <Ionicons name={trophyIcon} size={40} color={trophyColor} />
             </View>
           </View>
         </View>
 
-        {/* Result Header */}
-        {showAbort ? (
-          <>
-            <Text style={[s.winTitle, { color: COLORS.primary }]}>ABORTED</Text>
-            <Text style={s.winSub}>Opponent disconnected and fled the arena</Text>
-          </>
-        ) : (
-          <>
-            <Text style={[s.winTitle, { color: isWin ? COLORS.primary : '#F85149' }]}>
-              {isWin ? 'VICTORY!' : 'DEFEATED'}
-            </Text>
-            <Text style={s.winSub}>
-              {isWin ? `You dominated ${oppName.split(' ')[0]} in ${totalRounds} rounds` : `${oppName.split(' ')[0]} won this match`}
-            </Text>
-          </>
-        )}
+        {/* Result title */}
+        <Text style={[s.winTitle, { color: resultColor }]}>
+          {showAbort ? 'ABORTED' : isTie ? "IT'S A TIE!" : isWin ? 'VICTORY!' : 'DEFEATED'}
+        </Text>
 
-        {/* Final Score Dashboard */}
+        {/* Score card */}
         <View style={s.finalCard}>
           <View style={s.finalScoreRow}>
             <View style={s.finalPlayerCol}>
@@ -794,28 +857,57 @@ export default function MentalScreen({
             <Text style={s.finalDash}>VS</Text>
             <View style={s.finalPlayerCol}>
               <Text style={s.finalLabel}>{oppShort}</Text>
-              <Text style={[s.finalNum, { color: !isWin && !showAbort ? COLORS.accent : COLORS.text }]}>{oppScore}</Text>
+              <Text style={[s.finalNum, { color: !isWin && !isTie && !showAbort ? '#F85149' : COLORS.text }]}>{oppScore}</Text>
             </View>
           </View>
+
+          {/* Result line below scores */}
+          {!showAbort && (
+            <Text style={[s.finalResultLine, { color: resultColor }]}>
+              {isTie
+                ? 'Dead even — no winner'
+                : isWin
+                  ? `+${myScore - oppScore} pts ahead`
+                  : `${oppShort} led by ${oppScore - myScore} pts`}
+            </Text>
+          )}
+          {showAbort && <Text style={[s.finalResultLine, { color: COLORS.textMuted }]}>Opponent disconnected</Text>}
         </View>
 
-        {/* Rating adjustment pill */}
+        {/* XP + Rating inline text */}
         {!showAbort && (
-          <View style={[s.ratingPill, { backgroundColor: isWin ? 'rgba(14,206,143,0.12)' : 'rgba(248,81,73,0.12)' }]}>
-            <Text style={[s.ratingPillText, { color: isWin ? COLORS.primary : '#F85149' }]}>
-              {ratingChange >= 0 ? `▲ +${ratingChange}` : `▼ ${ratingChange}`} Rating · Current Rating: {xp.toLocaleString()}
+          <View style={s.xpRatingRow}>
+            <Text style={[s.xpRatingText, { color: COLORS.primary }]}>+{myXpGained} XP</Text>
+            <View style={s.xpRatingDot} />
+            <Text style={[s.xpRatingText, { color: myRatingChange >= 0 ? COLORS.primary : '#F85149' }]}>
+              {myRatingChange >= 0 ? `+${myRatingChange}` : `${myRatingChange}`} Rating
             </Text>
           </View>
         )}
 
-        {/* Play Again button with ready status indicator */}
+        {/* XP Breakdown Card — no emojis, trimmed items */}
+        {!showAbort && myXpBreakdown && (
+          <View style={s.xpCard}>
+            <Text style={s.xpCardTitle}>XP BREAKDOWN</Text>
+            {myXpBreakdown.base > 0 && <XPRow label={isWin ? 'Victory' : isTie ? 'Draw' : 'Defeat'} val={myXpBreakdown.base} color={resultColor} />}
+            {myXpBreakdown.accuracy > 0 && <XPRow label="Accuracy" val={myXpBreakdown.accuracy} />}
+            {myXpBreakdown.speed > 0 && <XPRow label="Speed" val={myXpBreakdown.speed} />}
+            {myXpBreakdown.streak > 0 && <XPRow label="Streak" val={myXpBreakdown.streak} />}
+            {myXpBreakdown.sportsmanship > 0 && <XPRow label="Stayed Match" val={myXpBreakdown.sportsmanship} />}
+            <View style={s.xpCardDivider} />
+            <View style={s.xpTotalRow}>
+              <Text style={s.xpTotalLabel}>TOTAL</Text>
+              <Text style={s.xpTotalValue}>+{myXpBreakdown.total} XP</Text>
+            </View>
+          </View>
+        )}
+
+        {/* Rematch button */}
         {!showAbort && (
           opponentLeft ? (
             <View style={s.playAgainWrapper}>
               <View style={[s.playAgainBtn, { backgroundColor: '#1C2128', borderColor: 'rgba(255,255,255,0.05)', borderWidth: 1 }]}>
-                <Text style={[s.playAgainText, { color: COLORS.textMuted }]}>
-                  Opponent Has Left
-                </Text>
+                <Text style={[s.playAgainText, { color: COLORS.textMuted }]}>Opponent Has Left</Text>
               </View>
             </View>
           ) : (
@@ -832,10 +924,13 @@ export default function MentalScreen({
             </TouchableOpacity>
           )
         )}
-
-        <TouchableOpacity style={s.homeBtn} onPress={leave} activeOpacity={0.75}>
-          <Text style={s.homeBtnText}>Return to Lobby</Text>
-        </TouchableOpacity>
+        {showAbort && (
+          <TouchableOpacity style={s.playAgainWrapper} onPress={leave} activeOpacity={0.75}>
+            <LinearGradient colors={[COLORS.primary, COLORS.accent]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={s.playAgainBtn}>
+              <Text style={s.playAgainText}>Return to Lobby</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+        )}
       </View>
     );
   }
@@ -847,20 +942,21 @@ export default function MentalScreen({
 // STYLES
 // ════════════════════════════════════════════════════════════════════════════════
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
-const isSmall = SCREEN_HEIGHT < 740;
+// Treat anything under 820px as "small" — catches most mid-range Android phones
+const isSmall = SCREEN_HEIGHT < 820;
 
 const SCALE = {
-  hudHeight: isSmall ? 78 : 92,
-  hudMargin: isSmall ? 8 : 20,
-  mathCardPadding: isSmall ? 18 : 28,
-  mathFontSize: isSmall ? 36 : 44,
-  answerHeight: isSmall ? 48 : 56,
-  answerMargin: isSmall ? 8 : 14,
-  keyRowHeight: isSmall ? 46 : 56,
-  keypadGap: isSmall ? 6 : 8,
-  keypadMargin: isSmall ? 4 : 8,
-  submitHeight: isSmall ? 48 : 56,
-  submitBottomMargin: Platform.OS === 'ios' ? (isSmall ? 14 : 28) : (isSmall ? 8 : 14),
+  hudHeight: isSmall ? 72 : 84,
+  hudMargin: isSmall ? 6 : 12,
+  mathCardPadding: isSmall ? 14 : 22,
+  mathFontSize: isSmall ? 32 : 40,
+  answerHeight: isSmall ? 44 : 52,
+  answerMargin: isSmall ? 6 : 10,
+  keyRowHeight: isSmall ? 44 : 52,
+  keypadGap: isSmall ? 5 : 7,
+  keypadMargin: isSmall ? 4 : 6,
+  submitHeight: isSmall ? 46 : 52,
+  submitBottomMargin: Platform.OS === 'ios' ? (isSmall ? 10 : 20) : (isSmall ? 6 : 10),
 };
 
 const s = StyleSheet.create({
@@ -885,9 +981,9 @@ const s = StyleSheet.create({
   welcomeName:  { fontSize: 22, color: COLORS.text, fontWeight: '700', marginTop: 2 },
   meAvatar: {
     width: 44, height: 44, borderRadius: 22,
-    backgroundColor: COLORS.primary, alignItems: 'center', justifyContent: 'center',
+    alignItems: 'center', justifyContent: 'center',
   },
-  meAvatarText: { fontSize: 15, fontWeight: '700', color: '#0B1A14' },
+  meAvatarText: { fontSize: 20, fontWeight: '700', color: '#fff' },
 
   // Center content: logo + title + rating
   lobbyCenterContent: {
@@ -1039,11 +1135,13 @@ const s = StyleSheet.create({
   gameRoot: {
     flex: 1,
     backgroundColor: COLORS.background,
+    paddingTop: isSmall ? 6 : 10,
+    justifyContent: 'space-between',
   },
   roundPillContainer: {
     alignItems: 'center',
-    marginTop: 10,
-    marginBottom: 12,
+    marginTop: 6,
+    marginBottom: 6,
   },
   roundPill: {
     backgroundColor: 'rgba(255, 255, 255, 0.03)',
@@ -1293,32 +1391,46 @@ const s = StyleSheet.create({
   // ── GAME OVER ─────────────────────────────────────────────────────────────
   gameOverRoot: {
     flex: 1, backgroundColor: COLORS.background,
-    alignItems: 'center', justifyContent: 'center',
-    paddingHorizontal: 24, paddingBottom: Platform.OS === 'ios' ? 36 : 24,
+    alignItems: 'center',
+    paddingHorizontal: 24,
+    paddingTop: 14,
+    paddingBottom: Platform.OS === 'ios' ? 36 : 20,
+    gap: 10,
   },
+  goBackBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 2,
+    alignSelf: 'flex-start',
+    paddingVertical: 6, paddingHorizontal: 4,
+  },
+  goBackText: { fontSize: 14, color: COLORS.textSecondary, fontWeight: '600' },
   gameOverGlow: {
     position: 'absolute', top: -40,
-    left: '10%', right: '10%', height: 240,
-    backgroundColor: COLORS.primaryGlow, opacity: 0.1, borderRadius: 120,
+    left: '10%', right: '10%', height: 180,
+    backgroundColor: COLORS.primaryGlow, opacity: 0.08, borderRadius: 90,
   },
   trophyWrapper: {
     position: 'relative', alignItems: 'center', justifyContent: 'center',
-    marginBottom: 24, width: 180, height: 180,
+    width: 110, height: 110,
   },
   confettiPiece: { position: 'absolute', width: 3, height: 10, borderRadius: 1.5 },
   trophyRing: {
-    width: 144, height: 144, borderRadius: 72,
-    borderWidth: 8,
+    width: 108, height: 108, borderRadius: 54,
+    borderWidth: 6,
     alignItems: 'center', justifyContent: 'center',
   },
   trophyInner: {
-    width: 98, height: 98, borderRadius: 49,
+    width: 74, height: 74, borderRadius: 37,
     backgroundColor: COLORS.surface, alignItems: 'center', justifyContent: 'center',
     borderWidth: 1,
     borderColor: COLORS.borderGlass,
   },
-  winTitle: { fontSize: 38, fontWeight: '900', marginBottom: 8, letterSpacing: -0.5 },
-  winSub: { fontSize: 14, color: COLORS.textSecondary, marginBottom: 28, textAlign: 'center', paddingHorizontal: 10 },
+  winTitle: { fontSize: 34, fontWeight: '900', letterSpacing: -0.5 },
+  // xp/rating inline
+  xpRatingRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  xpRatingText: { fontSize: 15, fontWeight: '800' },
+  xpRatingDot: { width: 4, height: 4, borderRadius: 2, backgroundColor: COLORS.textMuted },
+  // result line below score
+  finalResultLine: { fontSize: 12, fontWeight: '700', textAlign: 'center', marginTop: 6, letterSpacing: 0.3 },
   finalCard: {
     width: '100%', backgroundColor: COLORS.surface, borderRadius: 20,
     paddingVertical: 22, paddingHorizontal: 28,
@@ -1334,19 +1446,39 @@ const s = StyleSheet.create({
     fontSize: 11, fontWeight: '800', color: COLORS.textSecondary,
     letterSpacing: 1.5, marginBottom: 6,
   },
-  finalNum: { fontSize: 56, fontWeight: '900', lineHeight: 62 },
+  finalNum: { fontSize: 46, fontWeight: '900', lineHeight: 52 },
   finalDash: { fontSize: 20, color: COLORS.textMuted, fontWeight: '800' },
   ratingPill: {
-    borderRadius: 12, paddingHorizontal: 18, paddingVertical: 10, marginBottom: 24,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.03)',
+    borderRadius: 12, paddingHorizontal: 18, paddingVertical: 10,
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)',
+    alignItems: 'center',
   },
-  ratingPillText: { fontSize: 13, fontWeight: '700' },
-  playAgainWrapper: { width: '100%', borderRadius: 16, overflow: 'hidden', marginBottom: 10 },
-  playAgainBtn: { height: 56, alignItems: 'center', justifyContent: 'center', borderRadius: 16 },
-  playAgainText: { fontSize: 17, fontWeight: '800', color: '#0B1A14' },
-  homeBtn: { width: '100%', height: 50, alignItems: 'center', justifyContent: 'center' },
-  homeBtnText: { fontSize: 16, fontWeight: '700', color: COLORS.textSecondary },
+  ratingPillText: { fontSize: 13, fontWeight: '700', textAlign: 'center' },
+  // XP Breakdown Card
+  xpCard: {
+    width: '100%', backgroundColor: 'rgba(255,255,255,0.03)',
+    borderRadius: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,0.06)',
+    padding: 14,
+  },
+  xpCardTitle: { fontSize: 11, fontWeight: '800', color: COLORS.textMuted, letterSpacing: 1.5, marginBottom: 12, textAlign: 'center' },
+  xpCardDivider: { height: 1, backgroundColor: 'rgba(255,255,255,0.07)', marginVertical: 8 },
+  xpTotalRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingTop: 2 },
+  xpTotalLabel: { fontSize: 12, fontWeight: '700', color: COLORS.textMuted, letterSpacing: 1 },
+  xpTotalValue: { fontSize: 17, fontWeight: '900', color: COLORS.primary },
+  // Bonus popup
+  bonusPopup: {
+    alignSelf: 'center', alignItems: 'center', gap: 6,
+    marginBottom: 4,
+  },
+  bonusPtsText: { fontSize: 22, fontWeight: '900', color: '#fff', letterSpacing: 0.5 },
+  bonusBadgeRow: { flexDirection: 'row', gap: 8 },
+  bonusBadge: { borderRadius: 20, paddingHorizontal: 12, paddingVertical: 5, borderWidth: 1 },
+  bonusBadgeText: { fontSize: 12, fontWeight: '800', letterSpacing: 0.3 },
+  playAgainWrapper: { width: '100%', borderRadius: 16, overflow: 'hidden' },
+  playAgainBtn: { height: 52, alignItems: 'center', justifyContent: 'center', borderRadius: 16 },
+  playAgainText: { fontSize: 16, fontWeight: '800', color: '#0B1A14' },
+  homeBtn: { width: '100%', height: 44, alignItems: 'center', justifyContent: 'center' },
+  homeBtnText: { fontSize: 15, fontWeight: '700', color: COLORS.textSecondary },
 
   // New Lobby styling updates
   newRatingCard: {
